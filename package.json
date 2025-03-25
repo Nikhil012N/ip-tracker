@@ -1,0 +1,22 @@
+{
+  "name": "ip-tracker",
+  "version": "1.0.0",
+  "description": "A Node.js Express API that collects user details such as IP, User-Agent, Geolocation, and more.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "author": "Nikhil",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "express": "^4.18.1",
+    "geoip-lite": "^1.6.6",
+    "request-ip": "^3.1.1",
+    "useragent": "^2.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
