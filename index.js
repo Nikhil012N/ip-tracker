@@ -28,7 +28,7 @@ app.get('/', async (req, res) => {
     queryParams,
   };
 
-  res.json(userDetails);
+  res.status(200).send(userDetails);
 });
 
 // Start server
