@@ -29,3 +29,7 @@ Follow these steps to set up and run the project locally:
 ```bash
 git clone https://github.com/Nikhil012N/ip-tracker.git
 cd ip-tracker
+
+```bash
+npm install
+npm start
