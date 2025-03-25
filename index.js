@@ -12,7 +12,7 @@ const port = 3000;
 // Middleware to handle JSON requests
 app.use(express.json());
 
-app.get('/user-details', async (req, res) => {
+app.get('/', async (req, res) => {
   const clientIp = requestIp.getClientIp(req);
   const agent = useragent.parse(req.headers['user-agent']);
   const geo = geoip.lookup(clientIp);
