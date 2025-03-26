@@ -14,7 +14,8 @@
     "express": "^4.18.2",
    "geoip-lite": "^1.4.0",
     "request-ip": "^3.2.0",
-    "useragent": "^2.3.0"
+    "useragent": "^2.3.0",
+    "cors": "^2.8.4",
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
