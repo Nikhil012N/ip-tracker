@@ -12,7 +12,7 @@
   "dependencies": {
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "geoip-lite": "^1.6.7",
+   "geoip-lite": "^1.4.6",
     "request-ip": "^3.2.0",
     "useragent": "^2.3.1"
   },
