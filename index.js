@@ -73,9 +73,6 @@ function lookupGeo(ip) {
         timezone: g.timezone || null,
         latitude: Array.isArray(g.ll) ? g.ll[0] : null,
         longitude: Array.isArray(g.ll) ? g.ll[1] : null,
-        metro: g.metro ?? null,
-        area: g.area ?? null,
-        eu: g.eu === '1',
       },
       reason: null,
     };
@@ -96,26 +93,20 @@ function collectClientData(req) {
   return {
     ipAddress: clientIp || 'Unknown',
     userAgent,
-    geoLocation: geo,
-    geoMeta: { reason, source: 'geoip-lite (local)' },
+    ipGeo: geo,
+    ipGeoReason: reason,
     request: {
       method: req.method,
       protocol: req.protocol,
       hostname: req.hostname,
-      path: req.path,
       originalUrl: req.originalUrl,
       query: req.query,
-      secure: req.secure,
-      xhr: req.xhr,
-      ips: req.ips || [],
     },
     client: {
       referrer: req.headers.referer || req.headers.referrer || 'Direct',
       languages,
       preferredLanguage: languages[0] || null,
-      acceptEncoding: req.headers['accept-encoding'] || null,
     },
-    headers: req.headers,
     requestedAt: new Date().toISOString(),
   };
 }
@@ -130,12 +121,12 @@ function escapeHtml(v) {
     .replace(/'/g, '&#39;');
 }
 
+const E = (v) => (v === null || v === undefined || v === '' ? '' : escapeHtml(v));
+
 function renderHtml(data) {
-  const g = data.geoLocation || {};
+  const g = data.ipGeo || {};
   const ua = data.userAgent;
-  const geoNote = data.geoMeta.reason
-    ? `<tr><td>Note</td><td>${escapeHtml(data.geoMeta.reason)}</td></tr>`
-    : '';
+  const geoNote = data.ipGeoReason ? ` (${E(data.ipGeoReason)})` : '';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -151,41 +142,98 @@ td{padding:.35rem .5rem;vertical-align:top;border-bottom:1px solid #f0f0f0}
 td:first-child{color:#666;width:160px;white-space:nowrap}
 code{font-family:ui-monospace,Menlo,monospace;font-size:.9em;background:#f7f7f7;padding:1px 4px;border-radius:3px;word-break:break-all}
 a{color:#06c}
-.foot{margin-top:2rem;font-size:.85em;color:#888}
+.muted{color:#999;font-size:.9em}
+#gps-status{color:#666;font-style:italic}
 </style>
 </head>
 <body>
 <h2>Request</h2>
 <table>
-<tr><td>IP</td><td><code>${escapeHtml(data.ipAddress)}</code></td></tr>
-<tr><td>Method</td><td>${escapeHtml(data.request.method)}</td></tr>
-<tr><td>URL</td><td><code>${escapeHtml(data.request.originalUrl)}</code></td></tr>
-<tr><td>Host</td><td>${escapeHtml(data.request.hostname)}</td></tr>
-<tr><td>Protocol</td><td>${escapeHtml(data.request.protocol)}</td></tr>
-<tr><td>Referrer</td><td>${escapeHtml(data.client.referrer)}</td></tr>
-<tr><td>Language</td><td>${escapeHtml(data.client.preferredLanguage || '')}</td></tr>
+<tr><td>IP</td><td><code>${E(data.ipAddress)}</code></td></tr>
+<tr><td>Method</td><td>${E(data.request.method)}</td></tr>
+<tr><td>URL</td><td><code>${E(data.request.originalUrl)}</code></td></tr>
+<tr><td>Host</td><td>${E(data.request.hostname)}</td></tr>
+<tr><td>Referrer</td><td>${E(data.client.referrer)}</td></tr>
 </table>
 
-<h2>Location</h2>
+<h2>IP Location <span class="muted">(approximate)${geoNote}</span></h2>
 <table>
-<tr><td>Country</td><td>${escapeHtml(g.country || '')}</td></tr>
-<tr><td>Region</td><td>${escapeHtml(g.region || '')}</td></tr>
-<tr><td>City</td><td>${escapeHtml(g.city || '')}</td></tr>
-<tr><td>Timezone</td><td>${escapeHtml(g.timezone || '')}</td></tr>
-<tr><td>Latitude</td><td>${g.latitude != null ? escapeHtml(g.latitude) : ''}</td></tr>
-<tr><td>Longitude</td><td>${g.longitude != null ? escapeHtml(g.longitude) : ''}</td></tr>
-${geoNote}
+<tr><td>Country</td><td>${E(g.country)}</td></tr>
+<tr><td>Region</td><td>${E(g.region)}</td></tr>
+<tr><td>City</td><td>${E(g.city)}</td></tr>
+<tr><td>Timezone</td><td>${E(g.timezone)}</td></tr>
+<tr><td>Latitude</td><td>${g.latitude != null ? E(g.latitude) : ''}</td></tr>
+<tr><td>Longitude</td><td>${g.longitude != null ? E(g.longitude) : ''}</td></tr>
+</table>
+
+<h2>Precise Location <span class="muted">(browser GPS, requires permission)</span></h2>
+<table>
+<tr><td>Status</td><td id="gps-status">Waiting for permission…</td></tr>
+<tr><td>Latitude</td><td id="gps-lat">—</td></tr>
+<tr><td>Longitude</td><td id="gps-lon">—</td></tr>
+<tr><td>Accuracy</td><td id="gps-acc">—</td></tr>
 </table>
 
 <h2>Device</h2>
 <table>
-<tr><td>Browser</td><td>${escapeHtml(ua.family)} ${escapeHtml(ua.full)}</td></tr>
-<tr><td>OS</td><td>${escapeHtml(ua.os)}</td></tr>
-<tr><td>Device</td><td>${escapeHtml(ua.device)}</td></tr>
-<tr><td>User-Agent</td><td><code>${escapeHtml(ua.raw)}</code></td></tr>
+<tr><td>Browser</td><td>${E(ua.family)} ${E(ua.full)}</td></tr>
+<tr><td>OS</td><td>${E(ua.os)}</td></tr>
+<tr><td>Device</td><td>${E(ua.device)}</td></tr>
+<tr><td>User-Agent</td><td><code>${E(ua.raw)}</code></td></tr>
 </table>
 
-<div class="foot"><a href="?format=json">JSON</a> · ${escapeHtml(data.requestedAt)}</div>
+<div class="muted" style="margin-top:2rem">
+<a href="?format=json">JSON</a> · ${E(data.requestedAt)}
+</div>
+
+<script>
+(function () {
+  var statusEl = document.getElementById('gps-status');
+  var latEl = document.getElementById('gps-lat');
+  var lonEl = document.getElementById('gps-lon');
+  var accEl = document.getElementById('gps-acc');
+
+  if (!('geolocation' in navigator)) {
+    statusEl.textContent = 'Not supported by this browser';
+    return;
+  }
+
+  function onError(err) {
+    var msg = 'Unknown error';
+    if (err.code === 1) msg = 'Permission denied';
+    else if (err.code === 2) msg = 'Position unavailable';
+    else if (err.code === 3) msg = 'Timed out';
+    statusEl.textContent = msg;
+    statusEl.style.color = '#c00';
+  }
+
+  function onSuccess(pos) {
+    statusEl.textContent = 'Granted';
+    statusEl.style.color = '#080';
+    latEl.textContent = pos.coords.latitude.toFixed(6);
+    lonEl.textContent = pos.coords.longitude.toFixed(6);
+    accEl.textContent = '±' + Math.round(pos.coords.accuracy) + ' m';
+
+    // Optional: send coords back to server for logging / storage
+    fetch('/location', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        latitude: pos.coords.latitude,
+        longitude: pos.coords.longitude,
+        accuracy: pos.coords.accuracy,
+        timestamp: pos.timestamp
+      })
+    }).catch(function () { /* ignore */ });
+  }
+
+  navigator.geolocation.getCurrentPosition(onSuccess, onError, {
+    enableHighAccuracy: true,
+    timeout: 10000,
+    maximumAge: 0
+  });
+})();
+</script>
 </body>
 </html>`;
 }
@@ -212,6 +260,16 @@ app.get('/', (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// Receive precise coords from the browser
+app.post('/location', (req, res) => {
+  const { latitude, longitude, accuracy, timestamp } = req.body || {};
+  if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+    return res.status(400).json({ error: 'Invalid coordinates' });
+  }
+  logger.info(`Precise location received: ${latitude}, ${longitude} (±${accuracy}m)`);
+  res.json({ ok: true });
 });
 
 app.get('/health', (_req, res) => {
