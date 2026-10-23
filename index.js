@@ -5,10 +5,12 @@ const useragent = require('useragent');
 const geoip = require('geoip-lite');
 const requestIp = require('request-ip');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
-const TRUST_PROXY = process.env.TRUST_PROXY !== 'false';
+const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_KEY || '';
 
 const logger = {
   info: (...a) => console.log(`[INFO]  ${new Date().toISOString()}`, ...a),
@@ -88,7 +90,7 @@ function collectClientData(req) {
   const { geo, reason } = lookupGeo(clientIp);
 
   const rawLang = req.headers['accept-language'] || '';
-  const languages = rawLang.split(',').map(s => s.trim().split(';')[0]).filter(Boolean);
+  const languages = rawLang.split(',').map(s => s.trim().split(';')[0]).filter(Boolean).slice(0, 5);
 
   return {
     ipAddress: clientIp || 'Unknown',
@@ -127,6 +129,18 @@ function renderHtml(data) {
   const g = data.ipGeo || {};
   const ua = data.userAgent;
   const geoNote = data.ipGeoReason ? ` (${E(data.ipGeoReason)})` : '';
+  const hasCoords = g.latitude != null && g.longitude != null;
+
+  let mapBlock = '';
+  if (hasCoords) {
+    const embedUrl = `https://maps.google.com/maps?q=${g.latitude},${g.longitude}&z=10&output=embed`;
+    mapBlock = `
+<div style="margin-top:.75rem;border:1px solid #e5e5e5;border-radius:4px;overflow:hidden">
+  <iframe width="100%" height="300" style="border:0;display:block" loading="lazy" referrerpolicy="no-referrer-when-downgrade" src="${embedUrl}"></iframe>
+</div>`;
+  } else {
+    mapBlock = `<p class="muted" style="margin-top:.75rem">No coordinates available for map</p>`;
+  }
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -141,9 +155,7 @@ table{width:100%;border-collapse:collapse}
 td{padding:.35rem .5rem;vertical-align:top;border-bottom:1px solid #f0f0f0}
 td:first-child{color:#666;width:160px;white-space:nowrap}
 code{font-family:ui-monospace,Menlo,monospace;font-size:.9em;background:#f7f7f7;padding:1px 4px;border-radius:3px;word-break:break-all}
-a{color:#06c}
-.muted{color:#999;font-size:.9em}
-#gps-status{color:#666;font-style:italic}
+a{color:#06c}.muted{color:#999;font-size:.9em}
 </style>
 </head>
 <body>
@@ -152,10 +164,9 @@ a{color:#06c}
 <tr><td>IP</td><td><code>${E(data.ipAddress)}</code></td></tr>
 <tr><td>Method</td><td>${E(data.request.method)}</td></tr>
 <tr><td>URL</td><td><code>${E(data.request.originalUrl)}</code></td></tr>
-<tr><td>Host</td><td>${E(data.request.hostname)}</td></tr>
 <tr><td>Referrer</td><td>${E(data.client.referrer)}</td></tr>
+<tr><td>Language</td><td>${E(data.client.preferredLanguage || '')}</td></tr>
 </table>
-
 <h2>IP Location <span class="muted">(approximate)${geoNote}</span></h2>
 <table>
 <tr><td>Country</td><td>${E(g.country)}</td></tr>
@@ -165,15 +176,7 @@ a{color:#06c}
 <tr><td>Latitude</td><td>${g.latitude != null ? E(g.latitude) : ''}</td></tr>
 <tr><td>Longitude</td><td>${g.longitude != null ? E(g.longitude) : ''}</td></tr>
 </table>
-
-<h2>Precise Location <span class="muted">(browser GPS, requires permission)</span></h2>
-<table>
-<tr><td>Status</td><td id="gps-status">Waiting for permission…</td></tr>
-<tr><td>Latitude</td><td id="gps-lat">—</td></tr>
-<tr><td>Longitude</td><td id="gps-lon">—</td></tr>
-<tr><td>Accuracy</td><td id="gps-acc">—</td></tr>
-</table>
-
+${mapBlock}
 <h2>Device</h2>
 <table>
 <tr><td>Browser</td><td>${E(ua.family)} ${E(ua.full)}</td></tr>
@@ -181,68 +184,49 @@ a{color:#06c}
 <tr><td>Device</td><td>${E(ua.device)}</td></tr>
 <tr><td>User-Agent</td><td><code>${E(ua.raw)}</code></td></tr>
 </table>
-
-<div class="muted" style="margin-top:2rem">
-<a href="?format=json">JSON</a> · ${E(data.requestedAt)}
-</div>
-
-<script>
-(function () {
-  var statusEl = document.getElementById('gps-status');
-  var latEl = document.getElementById('gps-lat');
-  var lonEl = document.getElementById('gps-lon');
-  var accEl = document.getElementById('gps-acc');
-
-  if (!('geolocation' in navigator)) {
-    statusEl.textContent = 'Not supported by this browser';
-    return;
-  }
-
-  function onError(err) {
-    var msg = 'Unknown error';
-    if (err.code === 1) msg = 'Permission denied';
-    else if (err.code === 2) msg = 'Position unavailable';
-    else if (err.code === 3) msg = 'Timed out';
-    statusEl.textContent = msg;
-    statusEl.style.color = '#c00';
-  }
-
-  function onSuccess(pos) {
-    statusEl.textContent = 'Granted';
-    statusEl.style.color = '#080';
-    latEl.textContent = pos.coords.latitude.toFixed(6);
-    lonEl.textContent = pos.coords.longitude.toFixed(6);
-    accEl.textContent = '±' + Math.round(pos.coords.accuracy) + ' m';
-
-    // Optional: send coords back to server for logging / storage
-    fetch('/location', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        latitude: pos.coords.latitude,
-        longitude: pos.coords.longitude,
-        accuracy: pos.coords.accuracy,
-        timestamp: pos.timestamp
-      })
-    }).catch(function () { /* ignore */ });
-  }
-
-  navigator.geolocation.getCurrentPosition(onSuccess, onError, {
-    enableHighAccuracy: true,
-    timeout: 10000,
-    maximumAge: 0
-  });
-})();
-</script>
+<div class="muted" style="margin-top:2rem"><a href="?format=json">JSON</a> · ${E(data.requestedAt)}</div>
 </body>
 </html>`;
 }
 
 const app = express();
-if (TRUST_PROXY) app.set('trust proxy', true);
-app.use(cors());
+
+// Always trust proxy - but trust exactly 1 hop (safest interpretation)
+app.set('trust proxy', 1);
+
+// Security headers
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"], // needed for inline script
+      frameSrc: ["https://maps.google.com"],
+      imgSrc: ["'self'", "data:", "https:"],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+    },
+  },
+}));
+
+// Rate limiting: 100 requests per minute per IP
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { success: false, error: { code: 'RATE_LIMIT', message: 'Too many requests' } },
+});
+app.use(limiter);
+
+// Body size limit
 app.use(express.json({ limit: '10kb' }));
 
+// CORS - restrict to same origin in production
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production' ? false : true,
+}));
+
+// Access log
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
@@ -262,20 +246,11 @@ app.get('/', (req, res, next) => {
   }
 });
 
-// Receive precise coords from the browser
-app.post('/location', (req, res) => {
-  const { latitude, longitude, accuracy, timestamp } = req.body || {};
-  if (typeof latitude !== 'number' || typeof longitude !== 'number') {
-    return res.status(400).json({ error: 'Invalid coordinates' });
-  }
-  logger.info(`Precise location received: ${latitude}, ${longitude} (±${accuracy}m)`);
-  res.json({ ok: true });
-});
-
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
+// 404 handler
 app.use((req, res) => {
   if (req.accepts('json') && !req.accepts('html')) {
     return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Route not found' } });
@@ -283,6 +258,7 @@ app.use((req, res) => {
   res.status(404).type('html').send('<h1>404</h1>');
 });
 
+// Global error handler - never leaks stack traces
 app.use((err, req, res, _next) => {
   const known = err instanceof AppError;
   const statusCode = known ? err.statusCode : 500;
