@@ -8,6 +8,8 @@ const cors = require('cors');
 require('dotenv').config();
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
+const TRUST_PROXY = process.env.TRUST_PROXY !== 'false';
+
 const logger = {
   info: (...a) => console.log(`[INFO]  ${new Date().toISOString()}`, ...a),
   warn: (...a) => console.warn(`[WARN]  ${new Date().toISOString()}`, ...a),
@@ -59,22 +61,21 @@ function parseAgent(uaString) {
 }
 
 function lookupGeo(ip) {
-  if (!ip || isPrivateIp(ip)) {
-    return { geo: null, reason: 'private_or_missing_ip' };
-  }
+  if (!ip || isPrivateIp(ip)) return { geo: null, reason: 'private_or_missing_ip' };
   try {
-    const geo = geoip.lookup(ip);
-    if (!geo) return { geo: null, reason: 'not_in_database' };
+    const g = geoip.lookup(ip);
+    if (!g) return { geo: null, reason: 'not_in_database' };
     return {
       geo: {
-        country: geo.country || null,
-        region: geo.region || null,
-        city: geo.city || null,
-        timezone: geo.timezone || null,
-        latitude: Array.isArray(geo.ll) ? geo.ll[0] : null,
-        longitude: Array.isArray(geo.ll) ? geo.ll[1] : null,
-        metro: geo.metro ?? null,
-        area: geo.area ?? null,
+        country: g.country || null,
+        region: g.region || null,
+        city: g.city || null,
+        timezone: g.timezone || null,
+        latitude: Array.isArray(g.ll) ? g.ll[0] : null,
+        longitude: Array.isArray(g.ll) ? g.ll[1] : null,
+        metro: g.metro ?? null,
+        area: g.area ?? null,
+        eu: g.eu === '1',
       },
       reason: null,
     };
@@ -84,29 +85,37 @@ function lookupGeo(ip) {
   }
 }
 
-function buildApproxAddress(geo) {
-  if (!geo) return null;
-  const parts = [geo.city, geo.region, geo.country].filter(Boolean);
-  return parts.length ? parts.join(', ') : null;
-}
-
 function collectClientData(req) {
   const clientIp = resolveClientIp(req);
   const userAgent = parseAgent(req.headers['user-agent']);
   const { geo, reason } = lookupGeo(clientIp);
 
+  const rawLang = req.headers['accept-language'] || '';
+  const languages = rawLang.split(',').map(s => s.trim().split(';')[0]).filter(Boolean);
+
   return {
     ipAddress: clientIp || 'Unknown',
     userAgent,
     geoLocation: geo,
-    geoMeta: {
-      reason,
-      approximateAddress: buildApproxAddress(geo),
-      source: 'geoip-lite (local database)',
+    geoMeta: { reason, source: 'geoip-lite (local)' },
+    request: {
+      method: req.method,
+      protocol: req.protocol,
+      hostname: req.hostname,
+      path: req.path,
+      originalUrl: req.originalUrl,
+      query: req.query,
+      secure: req.secure,
+      xhr: req.xhr,
+      ips: req.ips || [],
     },
-    referrer: req.headers.referer || req.headers.referrer || 'Direct',
+    client: {
+      referrer: req.headers.referer || req.headers.referrer || 'Direct',
+      languages,
+      preferredLanguage: languages[0] || null,
+      acceptEncoding: req.headers['accept-encoding'] || null,
+    },
     headers: req.headers,
-    queryParams: req.query,
     requestedAt: new Date().toISOString(),
   };
 }
@@ -121,15 +130,11 @@ function escapeHtml(v) {
     .replace(/'/g, '&#39;');
 }
 
-const EMPTY = '<span class="empty">Not available</span>';
-const v = (x) => (x === null || x === undefined || x === '' ? EMPTY : escapeHtml(x));
-
 function renderHtml(data) {
-  const geo = data.geoLocation || {};
+  const g = data.geoLocation || {};
   const ua = data.userAgent;
-  const meta = data.geoMeta;
-  const notice = meta.reason
-    ? `<div class="notice">${escapeHtml(meta.reason)}</div>`
+  const geoNote = data.geoMeta.reason
+    ? `<tr><td>Note</td><td>${escapeHtml(data.geoMeta.reason)}</td></tr>`
     : '';
 
   return `<!DOCTYPE html>
@@ -137,75 +142,56 @@ function renderHtml(data) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Client Info Dashboard</title>
+<title>Client Info</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#f5f7fa 0%,#e4e8ec 100%);min-height:100vh;display:flex;justify-content:center;align-items:flex-start;padding:2rem}
-.card{background:#fff;border-radius:16px;box-shadow:0 8px 40px rgba(0,0,0,.08);max-width:680px;width:100%;overflow:hidden}
-.header{background:linear-gradient(135deg,#1e3c72 0%,#2a5298 100%);color:#fff;padding:1.5rem 2rem}
-.header h1{font-size:1.35rem;font-weight:600}
-.header p{font-size:.85rem;opacity:.8;margin-top:.25rem}
-.body{padding:1.75rem 2rem 2rem}
-.section{margin-bottom:1.5rem}
-.section:last-child{margin-bottom:0}
-.section-title{font-size:.7rem;text-transform:uppercase;letter-spacing:1px;color:#8899aa;margin-bottom:.75rem;font-weight:600}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
-.item{background:#f8fafc;border-radius:10px;padding:.75rem 1rem}
-.item.full{grid-column:1/-1}
-.label{font-size:.7rem;color:#8899aa;text-transform:uppercase;letter-spacing:.5px;margin-bottom:.2rem}
-.value{font-size:.95rem;color:#1a202c;font-weight:500;word-break:break-word}
-.value.mono{font-family:"SF Mono",Monaco,monospace;font-size:.82rem;color:#4a5568}
-.badge{display:inline-block;background:#ebf8ff;color:#2b6cb0;padding:.15rem .6rem;border-radius:6px;font-size:.85rem;font-weight:600}
-.empty{color:#a0aec0;font-style:italic;font-weight:400}
-.notice{margin-top:.5rem;font-size:.75rem;color:#b7791f;background:#fffaf0;border:1px solid #feebc8;border-radius:6px;padding:.35rem .6rem;display:inline-block}
-.footer{text-align:center;padding:.75rem;font-size:.75rem;color:#a0aec0;border-top:1px solid #edf2f7}
-.footer a{color:#2b6cb0;text-decoration:none}
-@media(max-width:520px){.grid{grid-template-columns:1fr}}
+body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;color:#222;background:#fff;max-width:720px;margin:2rem auto;padding:0 1rem}
+h2{font-size:1rem;margin:1.5rem 0 .5rem;color:#555;border-bottom:1px solid #e5e5e5;padding-bottom:.25rem}
+table{width:100%;border-collapse:collapse}
+td{padding:.35rem .5rem;vertical-align:top;border-bottom:1px solid #f0f0f0}
+td:first-child{color:#666;width:160px;white-space:nowrap}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.9em;background:#f7f7f7;padding:1px 4px;border-radius:3px;word-break:break-all}
+a{color:#06c}
+.foot{margin-top:2rem;font-size:.85em;color:#888}
 </style>
 </head>
 <body>
-<div class="card">
-<div class="header">
-<h1>🌐 Client Information</h1>
-<p>Local GeoIP lookup · approximate · city level</p>
-</div>
-<div class="body">
+<h2>Request</h2>
+<table>
+<tr><td>IP</td><td><code>${escapeHtml(data.ipAddress)}</code></td></tr>
+<tr><td>Method</td><td>${escapeHtml(data.request.method)}</td></tr>
+<tr><td>URL</td><td><code>${escapeHtml(data.request.originalUrl)}</code></td></tr>
+<tr><td>Host</td><td>${escapeHtml(data.request.hostname)}</td></tr>
+<tr><td>Protocol</td><td>${escapeHtml(data.request.protocol)}</td></tr>
+<tr><td>Referrer</td><td>${escapeHtml(data.client.referrer)}</td></tr>
+<tr><td>Language</td><td>${escapeHtml(data.client.preferredLanguage || '')}</td></tr>
+</table>
 
-<div class="section">
-<div class="section-title">Location</div>
-<div class="grid">
-<div class="item"><div class="label">IP Address</div><div class="value"><span class="badge">${escapeHtml(data.ipAddress)}</span></div></div>
-<div class="item"><div class="label">Approx. Address</div><div class="value">${v(meta.approximateAddress)}</div></div>
-<div class="item"><div class="label">Country</div><div class="value">${v(geo.country)}</div></div>
-<div class="item"><div class="label">Region</div><div class="value">${v(geo.region)}</div></div>
-<div class="item"><div class="label">City</div><div class="value">${v(geo.city)}</div></div>
-<div class="item"><div class="label">Timezone</div><div class="value">${v(geo.timezone)}</div></div>
-<div class="item"><div class="label">Latitude</div><div class="value mono">${geo.latitude != null ? escapeHtml(geo.latitude) : EMPTY}</div></div>
-<div class="item"><div class="label">Longitude</div><div class="value mono">${geo.longitude != null ? escapeHtml(geo.longitude) : EMPTY}</div></div>
-</div>
-${notice}
-</div>
+<h2>Location</h2>
+<table>
+<tr><td>Country</td><td>${escapeHtml(g.country || '')}</td></tr>
+<tr><td>Region</td><td>${escapeHtml(g.region || '')}</td></tr>
+<tr><td>City</td><td>${escapeHtml(g.city || '')}</td></tr>
+<tr><td>Timezone</td><td>${escapeHtml(g.timezone || '')}</td></tr>
+<tr><td>Latitude</td><td>${g.latitude != null ? escapeHtml(g.latitude) : ''}</td></tr>
+<tr><td>Longitude</td><td>${g.longitude != null ? escapeHtml(g.longitude) : ''}</td></tr>
+${geoNote}
+</table>
 
-<div class="section">
-<div class="section-title">Device</div>
-<div class="grid">
-<div class="item"><div class="label">Browser</div><div class="value">${escapeHtml(ua.family)} ${escapeHtml(ua.full)}</div></div>
-<div class="item"><div class="label">Operating System</div><div class="value">${escapeHtml(ua.os)}</div></div>
-<div class="item"><div class="label">Device</div><div class="value">${escapeHtml(ua.device)}</div></div>
-<div class="item"><div class="label">Referrer</div><div class="value">${escapeHtml(data.referrer)}</div></div>
-<div class="item full"><div class="label">Raw User Agent</div><div class="value mono">${escapeHtml(ua.raw) || EMPTY}</div></div>
-</div>
-</div>
+<h2>Device</h2>
+<table>
+<tr><td>Browser</td><td>${escapeHtml(ua.family)} ${escapeHtml(ua.full)}</td></tr>
+<tr><td>OS</td><td>${escapeHtml(ua.os)}</td></tr>
+<tr><td>Device</td><td>${escapeHtml(ua.device)}</td></tr>
+<tr><td>User-Agent</td><td><code>${escapeHtml(ua.raw)}</code></td></tr>
+</table>
 
-</div>
-<div class="footer"><a href="?format=json">View as JSON</a> · geoip-lite local database</div>
-</div>
+<div class="foot"><a href="?format=json">JSON</a> · ${escapeHtml(data.requestedAt)}</div>
 </body>
 </html>`;
 }
 
 const app = express();
-app.set('trust proxy', true);
+if (TRUST_PROXY) app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
@@ -229,14 +215,14 @@ app.get('/', (req, res, next) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), env: process.env.NODE_ENV || 'development' });
+  res.json({ status: 'ok', uptime: process.uptime() });
 });
 
 app.use((req, res) => {
   if (req.accepts('json') && !req.accepts('html')) {
     return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Route not found' } });
   }
-  res.status(404).type('html').send('<h1>404 — Not Found</h1>');
+  res.status(404).type('html').send('<h1>404</h1>');
 });
 
 app.use((err, req, res, _next) => {
@@ -252,10 +238,11 @@ app.use((err, req, res, _next) => {
       error: { code, message: known ? err.message : 'Internal server error' },
     });
   }
-  res.status(statusCode).type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Error ${statusCode}</title>
-<style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f7fafc}.box{background:#fff;padding:2rem 2.5rem;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);text-align:center}h1{color:#c53030;font-size:1.5rem;margin:0 0 .5rem}p{color:#4a5568;margin:.25rem 0}a{color:#2b6cb0}</style></head>
-<body><div class="box"><h1>Error ${statusCode}</h1><p>${escapeHtml(code)}</p>${known ? `<p>${escapeHtml(err.message)}</p>` : ''}<p><a href="/">← Back</a></p></div></body></html>`);
+  res.status(statusCode).type('html').send(
+    `<!DOCTYPE html><meta charset="UTF-8"><title>Error</title>` +
+    `<h1>Error ${statusCode}</h1><p>${escapeHtml(code)}</p>` +
+    `${known ? `<p>${escapeHtml(err.message)}</p>` : ''}<p><a href="/">Back</a></p>`
+  );
 });
 
 const server = app.listen(PORT, () => {
@@ -266,7 +253,6 @@ function shutdown(signal) {
   logger.info(`${signal} received — shutting down`);
   server.close((err) => {
     if (err) { logger.error('Shutdown error:', err); process.exit(1); }
-    logger.info('Server closed');
     process.exit(0);
   });
   setTimeout(() => process.exit(1), 10000).unref();
