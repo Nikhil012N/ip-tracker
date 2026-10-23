@@ -199,8 +199,8 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"], // needed for inline script
-      frameSrc: ["https://maps.google.com"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      frameSrc: ["https://*.google.com", "https://*.googleapis.com", "https://*.gstatic.com"],
       imgSrc: ["'self'", "data:", "https:"],
       objectSrc: ["'none'"],
       frameAncestors: ["'none'"],
