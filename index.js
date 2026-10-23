@@ -1,17 +1,13 @@
 'use strict';
 
 const express = require('express');
+const useragent = require('useragent');
+const geoip = require('geoip-lite');
+const requestIp = require('request-ip');
 const cors = require('cors');
-const { getLocation } = require('ip-based-location');
-const { UAParser } = require('ua-parser-js');
 require('dotenv').config();
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
-const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
-const LOCATION_TIMEOUT = parseInt(process.env.LOCATION_TIMEOUT_MS, 10) || 4000;
-const FALLBACK_IP = process.env.FALLBACK_IP || '8.8.8.8';
-const IS_DEV = (process.env.NODE_ENV || 'development') === 'development';
-
 const logger = {
   info: (...a) => console.log(`[INFO]  ${new Date().toISOString()}`, ...a),
   warn: (...a) => console.warn(`[WARN]  ${new Date().toISOString()}`, ...a),
@@ -31,14 +27,6 @@ function normalizeIp(ip) {
   return ip.replace(/^::ffff:/, '').trim();
 }
 
-function extractClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.length) {
-    return normalizeIp(forwarded.split(',')[0]);
-  }
-  return normalizeIp(req.ip || req.socket?.remoteAddress || '');
-}
-
 function isPrivateIp(ip) {
   if (!ip) return true;
   if (ip === '::1' || ip === 'localhost') return true;
@@ -52,92 +40,72 @@ function isPrivateIp(ip) {
   return false;
 }
 
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new AppError(`${label} timed out after ${ms}ms`, 504, 'UPSTREAM_TIMEOUT')),
-      ms
-    );
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+function resolveClientIp(req) {
+  return normalizeIp(requestIp.getClientIp(req) || '');
 }
 
-async function resolveLocation(ip) {
-  const result = { location: null, source: null, reason: null };
-  if (!ip) {
-    result.reason = 'no_ip';
-    return result;
-  }
-
-  let lookupIp = ip;
-  if (isPrivateIp(ip)) {
-    if (IS_DEV) {
-      result.reason = 'private_ip_fallback';
-      lookupIp = FALLBACK_IP;
-    } else {
-      result.reason = 'private_ip';
-      return result;
-    }
-  }
-
-  try {
-    const raw = await withTimeout(getLocation(lookupIp), LOCATION_TIMEOUT, 'location lookup');
-    if (!raw || typeof raw !== 'object' || !Object.keys(raw).length) {
-      result.reason = 'empty_result';
-      return result;
-    }
-    result.location = {
-      country: raw.country || null,
-      countryCode: raw.countryCode || null,
-      region: raw.region || null,
-      city: raw.city || null,
-      postalCode: raw.postalCode || null,
-      latitude: raw.latitude ?? null,
-      longitude: raw.longitude ?? null,
-      timezone: raw.timezone || null,
-      isp: raw.isp || null,
-    };
-    result.source = lookupIp === ip ? 'client_ip' : 'fallback_ip';
-    return result;
-  } catch (err) {
-    logger.warn('Location lookup failed:', err.message);
-    result.reason = err.code || 'lookup_failed';
-    return result;
-  }
-}
-
-function parseUserAgent(uaString) {
-  const r = new UAParser(uaString || '').getResult();
+function parseAgent(uaString) {
+  const agent = useragent.parse(uaString || '');
   return {
-    browser: [r.browser.name, r.browser.version].filter(Boolean).join(' ') || 'Unknown',
-    os: [r.os.name, r.os.version].filter(Boolean).join(' ') || 'Unknown',
-    device: r.device.type || 'desktop',
+    family: agent.family || 'Unknown',
+    major: agent.major || '',
+    minor: agent.minor || '',
+    patch: agent.patch || '',
+    full: agent.toVersion ? agent.toVersion() : '',
+    os: agent.os ? agent.os.toString() : 'Unknown',
+    device: agent.device ? agent.device.toString() : 'Unknown',
     raw: uaString || '',
   };
 }
 
-function buildApproxAddress(loc) {
-  if (!loc) return null;
-  const parts = [loc.city, loc.region, loc.postalCode, loc.country].filter(Boolean);
+function lookupGeo(ip) {
+  if (!ip || isPrivateIp(ip)) {
+    return { geo: null, reason: 'private_or_missing_ip' };
+  }
+  try {
+    const geo = geoip.lookup(ip);
+    if (!geo) return { geo: null, reason: 'not_in_database' };
+    return {
+      geo: {
+        country: geo.country || null,
+        region: geo.region || null,
+        city: geo.city || null,
+        timezone: geo.timezone || null,
+        latitude: Array.isArray(geo.ll) ? geo.ll[0] : null,
+        longitude: Array.isArray(geo.ll) ? geo.ll[1] : null,
+        metro: geo.metro ?? null,
+        area: geo.area ?? null,
+      },
+      reason: null,
+    };
+  } catch (err) {
+    logger.warn('GeoIP lookup failed:', err.message);
+    return { geo: null, reason: 'lookup_failed' };
+  }
+}
+
+function buildApproxAddress(geo) {
+  if (!geo) return null;
+  const parts = [geo.city, geo.region, geo.country].filter(Boolean);
   return parts.length ? parts.join(', ') : null;
 }
 
-async function collectClientData(req) {
-  const clientIp = extractClientIp(req);
-  const ua = parseUserAgent(req.headers['user-agent']);
-  const loc = await resolveLocation(clientIp);
+function collectClientData(req) {
+  const clientIp = resolveClientIp(req);
+  const userAgent = parseAgent(req.headers['user-agent']);
+  const { geo, reason } = lookupGeo(clientIp);
 
   return {
-    ip: clientIp || 'Unknown',
-    location: loc.location,
-    locationMeta: {
-      source: loc.source,
-      reason: loc.reason,
-      approximateAddress: buildApproxAddress(loc.location),
+    ipAddress: clientIp || 'Unknown',
+    userAgent,
+    geoLocation: geo,
+    geoMeta: {
+      reason,
+      approximateAddress: buildApproxAddress(geo),
+      source: 'geoip-lite (local database)',
     },
-    userAgent: ua,
     referrer: req.headers.referer || req.headers.referrer || 'Direct',
+    headers: req.headers,
     queryParams: req.query,
     requestedAt: new Date().toISOString(),
   };
@@ -157,9 +125,9 @@ const EMPTY = '<span class="empty">Not available</span>';
 const v = (x) => (x === null || x === undefined || x === '' ? EMPTY : escapeHtml(x));
 
 function renderHtml(data) {
-  const loc = data.location || {};
+  const geo = data.geoLocation || {};
   const ua = data.userAgent;
-  const meta = data.locationMeta;
+  const meta = data.geoMeta;
   const notice = meta.reason
     ? `<div class="notice">${escapeHtml(meta.reason)}</div>`
     : '';
@@ -199,23 +167,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Ar
 <div class="card">
 <div class="header">
 <h1>🌐 Client Information</h1>
-<p>IP-based location · approximate · city/postal level</p>
+<p>Local GeoIP lookup · approximate · city level</p>
 </div>
 <div class="body">
 
 <div class="section">
 <div class="section-title">Location</div>
 <div class="grid">
-<div class="item"><div class="label">IP Address</div><div class="value"><span class="badge">${escapeHtml(data.ip)}</span></div></div>
+<div class="item"><div class="label">IP Address</div><div class="value"><span class="badge">${escapeHtml(data.ipAddress)}</span></div></div>
 <div class="item"><div class="label">Approx. Address</div><div class="value">${v(meta.approximateAddress)}</div></div>
-<div class="item"><div class="label">Country</div><div class="value">${loc.country ? `${escapeHtml(loc.country)} (${escapeHtml(loc.countryCode || '')})` : EMPTY}</div></div>
-<div class="item"><div class="label">Region</div><div class="value">${v(loc.region)}</div></div>
-<div class="item"><div class="label">City</div><div class="value">${v(loc.city)}</div></div>
-<div class="item"><div class="label">Postal Code</div><div class="value">${v(loc.postalCode)}</div></div>
-<div class="item"><div class="label">Timezone</div><div class="value">${v(loc.timezone)}</div></div>
-<div class="item"><div class="label">ISP</div><div class="value">${v(loc.isp)}</div></div>
-<div class="item"><div class="label">Latitude</div><div class="value mono">${loc.latitude != null ? escapeHtml(loc.latitude) : EMPTY}</div></div>
-<div class="item"><div class="label">Longitude</div><div class="value mono">${loc.longitude != null ? escapeHtml(loc.longitude) : EMPTY}</div></div>
+<div class="item"><div class="label">Country</div><div class="value">${v(geo.country)}</div></div>
+<div class="item"><div class="label">Region</div><div class="value">${v(geo.region)}</div></div>
+<div class="item"><div class="label">City</div><div class="value">${v(geo.city)}</div></div>
+<div class="item"><div class="label">Timezone</div><div class="value">${v(geo.timezone)}</div></div>
+<div class="item"><div class="label">Latitude</div><div class="value mono">${geo.latitude != null ? escapeHtml(geo.latitude) : EMPTY}</div></div>
+<div class="item"><div class="label">Longitude</div><div class="value mono">${geo.longitude != null ? escapeHtml(geo.longitude) : EMPTY}</div></div>
 </div>
 ${notice}
 </div>
@@ -223,37 +189,37 @@ ${notice}
 <div class="section">
 <div class="section-title">Device</div>
 <div class="grid">
-<div class="item"><div class="label">Browser</div><div class="value">${escapeHtml(ua.browser)}</div></div>
+<div class="item"><div class="label">Browser</div><div class="value">${escapeHtml(ua.family)} ${escapeHtml(ua.full)}</div></div>
 <div class="item"><div class="label">Operating System</div><div class="value">${escapeHtml(ua.os)}</div></div>
-<div class="item"><div class="label">Device Type</div><div class="value">${escapeHtml(ua.device)}</div></div>
+<div class="item"><div class="label">Device</div><div class="value">${escapeHtml(ua.device)}</div></div>
 <div class="item"><div class="label">Referrer</div><div class="value">${escapeHtml(data.referrer)}</div></div>
 <div class="item full"><div class="label">Raw User Agent</div><div class="value mono">${escapeHtml(ua.raw) || EMPTY}</div></div>
 </div>
 </div>
 
 </div>
-<div class="footer"><a href="?format=json">View as JSON</a> · Location data is approximate</div>
+<div class="footer"><a href="?format=json">View as JSON</a> · geoip-lite local database</div>
 </div>
 </body>
 </html>`;
 }
 
 const app = express();
-if (TRUST_PROXY) app.set('trust proxy', true);
+app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
-    logger.info(`${req.method} ${req.originalUrl} → ${res.statusCode} (${Date.now() - start}ms) ip=${extractClientIp(req)}`);
+    logger.info(`${req.method} ${req.originalUrl} → ${res.statusCode} (${Date.now() - start}ms) ip=${resolveClientIp(req) || 'unknown'}`);
   });
   next();
 });
 
-app.get('/', async (req, res, next) => {
+app.get('/', (req, res, next) => {
   try {
-    const data = await collectClientData(req);
+    const data = collectClientData(req);
     const wantsJson = req.query.format === 'json' || req.accepts(['html', 'json']) === 'json';
     if (wantsJson) return res.json({ success: true, data });
     res.type('html').send(renderHtml(data));
@@ -263,7 +229,7 @@ app.get('/', async (req, res, next) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), env: IS_DEV ? 'development' : 'production' });
+  res.json({ status: 'ok', uptime: process.uptime(), env: process.env.NODE_ENV || 'development' });
 });
 
 app.use((req, res) => {
@@ -293,16 +259,13 @@ app.use((err, req, res, _next) => {
 });
 
 const server = app.listen(PORT, () => {
-  logger.info(`Server running at http://localhost:${PORT} (env=${IS_DEV ? 'development' : 'production'})`);
+  logger.info(`Server running at http://localhost:${PORT}`);
 });
 
 function shutdown(signal) {
   logger.info(`${signal} received — shutting down`);
   server.close((err) => {
-    if (err) {
-      logger.error('Error during shutdown:', err);
-      process.exit(1);
-    }
+    if (err) { logger.error('Shutdown error:', err); process.exit(1); }
     logger.info('Server closed');
     process.exit(0);
   });
