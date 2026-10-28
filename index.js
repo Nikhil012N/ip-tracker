@@ -276,7 +276,7 @@ async function collectClientData(req) {
 }
 
 // ---------------------------------------------------------------------------
-// HTML rendering — enterprise grid layout
+// HTML rendering — shadcn/ui visual language, fully responsive
 // ---------------------------------------------------------------------------
 function escapeHtml(v) {
   if (v === null || v === undefined) return '';
@@ -290,22 +290,20 @@ function escapeHtml(v) {
 
 const E = (v) => (v === null || v === undefined || v === '' ? '—' : escapeHtml(v));
 
-function pill(label, tone = 'neutral') {
-  return `<span class="pill pill-${tone}">${escapeHtml(label)}</span>`;
-}
-
 function field(label, value, opts = {}) {
   const { mono = false, cls = '' } = opts;
   return `<div class="field ${cls}">
-    <div class="field-label">${escapeHtml(label)}</div>
-    <div class="field-value${mono ? ' mono' : ''}">${value}</div>
+    <dt class="field-label">${escapeHtml(label)}</dt>
+    <dd class="field-value${mono ? ' mono' : ''}">${value}</dd>
   </div>`;
 }
 
 function card(title, body, extraClass = '') {
   return `<section class="card ${extraClass}">
-    <header class="card-header"><h2>${escapeHtml(title)}</h2></header>
-    <div class="card-body">${body}</div>
+    <div class="card-header">
+      <h2 class="card-title">${escapeHtml(title)}</h2>
+    </div>
+    <div class="card-content">${body}</div>
   </section>`;
 }
 
@@ -313,220 +311,389 @@ function renderHtml(data) {
   const g = data.ipGeo || {};
   const ua = data.userAgent;
   const hasCoords = g.latitude != null && g.longitude != null;
-  const geoNote = data.ipGeoReason
-    ? pill(data.ipGeoReason, 'warn')
-    : g.status === 'success'
-      ? pill('resolved', 'ok')
-      : pill('unknown', 'neutral');
 
-  // --- Risk flags -------------------------------------------------------
-  const riskFlags = [];
-  if (g.proxy === true) riskFlags.push(pill('Proxy / VPN', 'danger'));
-  if (g.hosting === true) riskFlags.push(pill('Hosting / Datacenter', 'danger'));
-  if (g.mobile === true) riskFlags.push(pill('Mobile Network', 'info'));
-  if (riskFlags.length === 0) riskFlags.push(pill('Residential / Clean', 'ok'));
+  const statusText = data.ipGeoReason
+    ? data.ipGeoReason
+    : g.status === 'success'
+      ? 'resolved'
+      : 'unknown';
 
   // --- Map --------------------------------------------------------------
   const mapBlock = hasCoords
     ? `<div class="map-wrap">
-        <iframe width="100%" height="320" style="border:0;display:block" loading="lazy"
+        <iframe
+          title="IP location map"
+          width="100%"
+          height="100%"
+          style="border:0;display:block"
+          loading="lazy"
           referrerpolicy="no-referrer-when-downgrade"
           src="https://maps.google.com/maps?q=${g.latitude},${g.longitude}&z=10&output=embed"></iframe>
        </div>`
-    : `<div class="map-empty">No coordinates available — map unavailable</div>`;
+    : `<div class="map-empty">No coordinates available for map</div>`;
 
-  // --- Network card -----------------------------------------------------
-  const networkCard = card(
-    'Network & Organization',
-    `<div class="grid grid-2">
-      ${field('ISP', E(g.isp))}
-      ${field('Organization', E(g.org))}
-      ${field('AS Number', E(g.as), { mono: true })}
-      ${field('AS Name', E(g.asname))}
-      ${field('Reverse DNS', E(g.reverse), { mono: true, cls: 'span-2' })}
-      ${field('Reported Query IP', E(g.query), { mono: true })}
-    </div>
-    <div class="flags">${riskFlags.join('')}</div>`
+  // --- Summary ----------------------------------------------------------
+  const summaryCard = card(
+    'Summary',
+    `<dl class="grid grid-2">
+      ${field('Client IP', E(data.ipAddress), { mono: true })}
+      ${field('IP resolution', `<span class="badge">${escapeHtml(statusText)}</span>`)}
+      ${field('Location', [g.city, g.regionName, g.country].filter(Boolean).map(escapeHtml).join(', ') || '—', { cls: 'span-2' })}
+      ${field('Network', [g.isp, g.as].filter(Boolean).map(escapeHtml).join(' · ') || '—', { cls: 'span-2' })}
+    </dl>`
   );
 
-  // --- Geolocation card -------------------------------------------------
+  // --- Geolocation ------------------------------------------------------
   const geoCard = card(
     'Geolocation',
-    `<div class="grid grid-2">
-      ${field('Continent', `${E(g.continent)} ${g.continentCode ? `<span class="sub">(${escapeHtml(g.continentCode)})</span>` : ''}`)}
-      ${field('Country', `${E(g.country)} ${g.countryCode ? `<span class="sub">(${escapeHtml(g.countryCode)})</span>` : ''}`)}
-      ${field('Region', `${E(g.regionName)} ${g.region ? `<span class="sub">(${escapeHtml(g.region)})</span>` : ''}`)}
+    `<dl class="grid grid-2">
+      ${field('Continent', g.continent ? `${escapeHtml(g.continent)} (${escapeHtml(g.continentCode || '—')})` : '—')}
+      ${field('Country', g.country ? `${escapeHtml(g.country)} (${escapeHtml(g.countryCode || '—')})` : '—')}
+      ${field('Region', g.regionName ? `${escapeHtml(g.regionName)} (${escapeHtml(g.region || '—')})` : '—')}
       ${field('City', E(g.city))}
       ${field('District', E(g.district))}
-      ${field('Postal Code', E(g.zip), { mono: true })}
+      ${field('Postal code', E(g.zip), { mono: true })}
       ${field('Latitude', g.latitude != null ? E(g.latitude) : '—', { mono: true })}
       ${field('Longitude', g.longitude != null ? E(g.longitude) : '—', { mono: true })}
       ${field('Timezone', E(g.timezone))}
-      ${field('UTC Offset', g.offset != null ? `UTC${g.offset >= 0 ? '+' : ''}${g.offset / 3600}` : '—', { mono: true })}
+      ${field('UTC offset', g.offset != null ? `UTC${g.offset >= 0 ? '+' : ''}${g.offset / 3600}` : '—', { mono: true })}
       ${field('Currency', E(g.currency), { cls: 'span-2' })}
-    </div>
+    </dl>
     ${mapBlock}`
   );
 
-  // --- Device card ------------------------------------------------------
-  const deviceCard = card(
-    'Device & Browser',
-    `<div class="grid grid-2">
-      ${field('Browser', `${E(ua.family)} ${E(ua.full)}`)}
-      ${field('Operating System', E(ua.os))}
-      ${field('Device Type', E(ua.device))}
-      ${field('Preferred Language', E(data.client.preferredLanguage))}
-      ${field('All Languages', data.client.languages.length ? data.client.languages.map(escapeHtml).join(', ') : '—', { cls: 'span-2' })}
-      ${field('Referrer', E(data.client.referrer))}
-      ${field('User-Agent', E(ua.raw), { mono: true, cls: 'span-2' })}
-    </div>`
+  // --- Network ----------------------------------------------------------
+  const flags = [];
+  if (g.proxy === true) flags.push('<span class="badge badge-outline">Proxy</span>');
+  if (g.hosting === true) flags.push('<span class="badge badge-outline">Hosting</span>');
+  if (g.mobile === true) flags.push('<span class="badge badge-outline">Mobile</span>');
+  if (flags.length === 0) flags.push('<span class="badge">Residential</span>');
+
+  const networkCard = card(
+    'Network',
+    `<dl class="grid grid-2">
+      ${field('ISP', E(g.isp))}
+      ${field('Organization', E(g.org))}
+      ${field('AS number', E(g.as), { mono: true })}
+      ${field('AS name', E(g.asname))}
+      ${field('Reverse DNS', E(g.reverse), { mono: true, cls: 'span-2' })}
+      ${field('Reported query IP', E(g.query), { mono: true })}
+    </dl>
+    <div class="flags">${flags.join('')}</div>`
   );
 
-  // --- Request card -----------------------------------------------------
+  // --- Device -----------------------------------------------------------
+  const deviceCard = card(
+    'Device',
+    `<dl class="grid grid-2">
+      ${field('Browser', `${E(ua.family)} ${E(ua.full)}`)}
+      ${field('Operating system', E(ua.os))}
+      ${field('Device type', E(ua.device))}
+      ${field('Preferred language', E(data.client.preferredLanguage))}
+      ${field('All languages', data.client.languages.length ? data.client.languages.map(escapeHtml).join(', ') : '—', { cls: 'span-2' })}
+      ${field('Referrer', E(data.client.referrer))}
+      ${field('User-Agent', E(ua.raw), { mono: true, cls: 'span-2' })}
+    </dl>`
+  );
+
+  // --- Request ----------------------------------------------------------
   const requestCard = card(
     'Request',
-    `<div class="grid grid-2">
-      ${field('Client IP', E(data.ipAddress), { mono: true })}
+    `<dl class="grid grid-2">
       ${field('Method', E(data.request.method), { mono: true })}
       ${field('Protocol', E(data.request.protocol))}
       ${field('Hostname', E(data.request.hostname))}
+      ${field('Client IP', E(data.ipAddress), { mono: true })}
       ${field('URL', E(data.request.originalUrl), { mono: true, cls: 'span-2' })}
-      ${field('Requested At', E(data.requestedAt), { mono: true, cls: 'span-2' })}
-    </div>`
+      ${field('Requested at', E(data.requestedAt), { mono: true, cls: 'span-2' })}
+    </dl>`
   );
 
   return `<!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Client Info · Diagnostic Report</title>
+<meta name="color-scheme" content="dark">
+<title>Client Info</title>
 <style>
+  /* ------------------------------------------------------------------
+     shadcn/ui tokens — dark mode
+     ------------------------------------------------------------------ */
   :root {
-    --bg: #0b0f17;
-    --surface: #121826;
-    --surface-2: #182033;
-    --border: #232c42;
-    --text: #e6ebf5;
-    --muted: #8a94a8;
-    --accent: #5b8def;
-    --ok: #22c55e;
-    --warn: #f59e0b;
-    --danger: #ef4444;
-    --info: #06b6d4;
-    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.985 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --border: oklch(0.269 0 0);
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+      "Liberation Mono", "Courier New", monospace;
   }
+
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
-  body {
-    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif;
-    background: radial-gradient(1200px 600px at 20% -10%, #17233c 0%, var(--bg) 55%);
-    color: var(--text);
-    min-height: 100vh;
-    padding: 2rem 1.25rem 4rem;
-  }
-  .wrap { max-width: 1120px; margin: 0 auto; }
+  html { -webkit-text-size-adjust: 100%; }
 
-  /* Header */
+  body {
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    background: var(--background);
+    color: var(--foreground);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Container — responsive horizontal padding, centered, capped width */
+  .wrap {
+    width: 100%;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+  }
+  @media (min-width: 640px) {
+    .wrap { padding: 2rem 1.5rem 4rem; }
+  }
+  @media (min-width: 1024px) {
+    .wrap { padding: 2.5rem 2rem 5rem; }
+  }
+
+  /* Header — stacks on mobile, side-by-side from sm up */
   .page-header {
-    display: flex; align-items: flex-start; justify-content: space-between;
-    gap: 1rem; flex-wrap: wrap; margin-bottom: 1.75rem;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  @media (min-width: 640px) {
+    .page-header {
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+    }
   }
   .page-header h1 {
-    font-size: 1.35rem; font-weight: 600; margin: 0 0 .25rem;
+    font-size: 1.125rem;
+    font-weight: 600;
     letter-spacing: -0.01em;
+    margin: 0;
   }
-  .page-header p { margin: 0; color: var(--muted); font-size: .875rem; }
-  .header-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
-  .btn {
-    display: inline-flex; align-items: center; gap: .4rem;
-    padding: .5rem .85rem; border-radius: 8px; font-size: .8125rem;
-    border: 1px solid var(--border); background: var(--surface-2);
-    color: var(--text); text-decoration: none; cursor: pointer;
-    transition: background .15s, border-color .15s;
+  .page-header p {
+    margin: 0.25rem 0 0;
+    font-size: 0.8125rem;
+    color: var(--muted-foreground);
+    word-break: break-word;
   }
-  .btn:hover { background: #1f2a44; border-color: #2f3d5c; }
-  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .btn-primary:hover { background: #4a7ce0; border-color: #4a7ce0; }
+  .header-actions {
+    display: flex;
+    gap: 0.5rem;
+    width: 100%;
+  }
+  @media (min-width: 640px) {
+    .header-actions { width: auto; }
+  }
 
-  /* Cards */
-  .card {
-    background: linear-gradient(180deg, var(--surface) 0%, #0f1626 100%);
+  /* Buttons — full-width on mobile, auto from sm up */
+  .btn {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.375rem;
+    height: 2.25rem;
+    padding: 0 1rem;
+    border-radius: calc(var(--radius) - 2px);
+    font-size: 0.875rem;
+    font-weight: 500;
+    font-family: inherit;
     border: 1px solid var(--border);
-    border-radius: 12px;
+    background: transparent;
+    color: var(--foreground);
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:hover { background: var(--accent); color: var(--accent-foreground); }
+  .btn-primary {
+    background: var(--primary);
+    color: var(--primary-foreground);
+    border-color: var(--primary);
+  }
+  .btn-primary:hover { opacity: 0.9; background: var(--primary); color: var(--primary-foreground); }
+  @media (min-width: 640px) {
+    .btn { flex: 0 0 auto; }
+  }
+
+  /* Card */
+  .card {
+    background: var(--card);
+    color: var(--card-foreground);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
     overflow: hidden;
-    margin-bottom: 1.25rem;
-    box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 10px 30px -18px rgba(0,0,0,0.9);
+    margin-bottom: 1rem;
   }
   .card-header {
-    padding: .85rem 1.15rem;
-    border-bottom: 1px solid var(--border);
-    background: rgba(255,255,255,0.015);
-    display: flex; align-items: center; justify-content: space-between; gap: .75rem;
+    padding: 1rem 1rem 0.5rem;
   }
-  .card-header h2 {
-    font-size: .8125rem; font-weight: 600; letter-spacing: .06em;
-    text-transform: uppercase; color: #aab4c8; margin: 0;
+  @media (min-width: 640px) {
+    .card-header { padding: 1rem 1.25rem 0.5rem; }
   }
-  .card-body { padding: 1.1rem 1.15rem 1.2rem; }
+  .card-title {
+    font-size: 0.875rem;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    margin: 0;
+    color: var(--card-foreground);
+  }
+  .card-content {
+    padding: 0.75rem 1rem 1rem;
+  }
+  @media (min-width: 640px) {
+    .card-content { padding: 0.75rem 1.25rem 1.25rem; }
+  }
 
-  /* Grid */
-  .grid { display: grid; gap: .9rem 1.25rem; }
-  .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .span-2 { grid-column: span 2; }
-  @media (max-width: 640px) {
-    .grid-2 { grid-template-columns: 1fr; }
-    .span-2 { grid-column: auto; }
+  /* Grid — single column on mobile, two columns from sm up */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.875rem 1.25rem;
+    margin: 0;
+  }
+  @media (min-width: 640px) {
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .span-2 { grid-column: span 2; }
   }
 
-  /* Fields */
-  .field { min-width: 0; }
+  /* Field */
+  .field { min-width: 0; margin: 0; }
   .field-label {
-    font-size: .6875rem; text-transform: uppercase; letter-spacing: .07em;
-    color: var(--muted); margin-bottom: .2rem; font-weight: 500;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--muted-foreground);
+    margin: 0 0 0.25rem;
+    line-height: 1.4;
   }
   .field-value {
-    font-size: .9rem; color: var(--text); word-break: break-word;
+    font-size: 0.875rem;
+    color: var(--foreground);
+    margin: 0;
+    line-height: 1.5;
+    word-break: break-word;
     overflow-wrap: anywhere;
   }
-  .field-value.mono { font-family: var(--mono); font-size: .84rem; color: #c9d4e8; }
-  .sub { color: var(--muted); font-size: .8125rem; margin-left: .15rem; }
-
-  /* Pills */
-  .flags { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: 1rem; }
-  .pill {
-    display: inline-flex; align-items: center;
-    padding: .22rem .6rem; border-radius: 999px;
-    font-size: .72rem; font-weight: 500; letter-spacing: .02em;
-    border: 1px solid transparent;
+  .field-value.mono {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    color: var(--foreground);
   }
-  .pill-ok      { background: rgba(34,197,94,0.1);  color: #6ee7a0; border-color: rgba(34,197,94,0.25); }
-  .pill-warn    { background: rgba(245,158,11,0.1); color: #fbbf24; border-color: rgba(245,158,11,0.25); }
-  .pill-danger  { background: rgba(239,68,68,0.1);  color: #f87171; border-color: rgba(239,68,68,0.25); }
-  .pill-info    { background: rgba(6,182,212,0.1);  color: #67e8f9; border-color: rgba(6,182,212,0.25); }
-  .pill-neutral { background: rgba(138,148,168,0.1);color: #aab4c8; border-color: rgba(138,148,168,0.25); }
 
-  /* Map */
+  /* Badge */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    border-radius: calc(var(--radius) - 4px);
+    border: 1px solid transparent;
+    background: var(--secondary);
+    color: var(--secondary-foreground);
+    font-size: 0.75rem;
+    font-weight: 500;
+    line-height: 1;
+    padding: 0.25rem 0.5rem;
+    white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .badge-outline {
+    background: transparent;
+    color: var(--foreground);
+    border-color: var(--border);
+  }
+
+  .flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+  }
+
+  /* Map — fixed aspect ratio, responsive height */
   .map-wrap {
-    margin-top: 1.1rem;
+    position: relative;
+    width: 100%;
+    margin-top: 1rem;
     border: 1px solid var(--border);
-    border-radius: 10px; overflow: hidden;
-    background: #0a0f1a;
+    border-radius: calc(var(--radius) - 2px);
+    overflow: hidden;
+    background: var(--muted);
+    aspect-ratio: 16 / 10;
+  }
+  .map-wrap iframe {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
   }
   .map-empty {
-    margin-top: 1.1rem; padding: 1.5rem 1rem; text-align: center;
-    color: var(--muted); font-size: .85rem;
-    border: 1px dashed var(--border); border-radius: 10px;
+    margin-top: 1rem;
+    padding: 1.5rem 1rem;
+    text-align: center;
+    font-size: 0.8125rem;
+    color: var(--muted-foreground);
+    border: 1px dashed var(--border);
+    border-radius: calc(var(--radius) - 2px);
+  }
+  @media (min-width: 640px) {
+    .map-empty { padding: 2rem 1rem; }
   }
 
-  /* Footer */
+  /* Footer — stacks on mobile */
   .footer {
-    display: flex; justify-content: space-between; align-items: center;
-    gap: .75rem; flex-wrap: wrap;
-    color: var(--muted); font-size: .78rem; margin-top: 1.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 1.5rem;
+    font-size: 0.75rem;
+    color: var(--muted-foreground);
+    word-break: break-word;
   }
-  .footer a { color: var(--accent); text-decoration: none; }
-  .footer a:hover { text-decoration: underline; }
+  @media (min-width: 640px) {
+    .footer {
+      flex-direction: row;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+    }
+  }
+  .footer a {
+    color: var(--muted-foreground);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .footer a:hover { color: var(--foreground); }
+
+  /* Respect reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    .btn { transition: none; }
+  }
 </style>
 </head>
 <body>
@@ -534,8 +701,8 @@ function renderHtml(data) {
 
   <header class="page-header">
     <div>
-      <h1>Client Diagnostic Report</h1>
-      <p>Full request, device, and network intelligence · ${escapeHtml(data.requestedAt)}</p>
+      <h1>Client Info</h1>
+      <p>Request, device, and network diagnostic · ${escapeHtml(data.requestedAt)}</p>
     </div>
     <div class="header-actions">
       <a class="btn btn-primary" href="?format=json">View JSON</a>
@@ -543,23 +710,14 @@ function renderHtml(data) {
     </div>
   </header>
 
-  ${card(
-    'Summary',
-    `<div class="grid grid-2">
-      ${field('Client IP', E(data.ipAddress), { mono: true })}
-      ${field('IP Resolution', geoNote)}
-      ${field('Location', [g.city, g.regionName, g.country].filter(Boolean).map(escapeHtml).join(', ') || '—', { cls: 'span-2' })}
-      ${field('Network', [g.isp, g.as].filter(Boolean).map(escapeHtml).join(' · ') || '—', { cls: 'span-2' })}
-    </div>`
-  )}
-
+  ${summaryCard}
   ${geoCard}
   ${networkCard}
   ${deviceCard}
   ${requestCard}
 
   <footer class="footer">
-    <span>ip-api.com · cached ${Math.round(GEO_CACHE_TTL_MS / 60000)} min · node ${escapeHtml(process.version)}</span>
+    <span>ip-api.com · cached ${Math.round(GEO_CACHE_TTL_MS / 60000)} min</span>
     <span><a href="?format=json">JSON</a> · <a href="/health">Health</a></span>
   </footer>
 
@@ -682,7 +840,7 @@ function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('unhandledRejection', (reason) => logger.error('Unhandled rejection:', reason));
-process.on('uncaughtException', (err) => {
+process.on('uncaughtException', (err) {
   logger.error('Uncaught exception:', err);
   shutdown('uncaughtException');
 });
