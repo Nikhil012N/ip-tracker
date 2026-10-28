@@ -9,19 +9,30 @@ const rateLimit = require('express-rate-limit');
 const http = require('http');
 
 // ---------------------------------------------------------------------------
-// Constants — single source of truth for tuning
+// Constants
 // ---------------------------------------------------------------------------
 const PORT = 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
-const GEO_API_HOST = 'ip-api.com';           // free tier: HTTP only, 45 req/min
-const GEO_API_FIELDS = 'status,message,country,regionName,city,timezone,lat,lon,query';
+const GEO_API_HOST = 'ip-api.com';
+const GEO_API_FIELDS = [
+  'status', 'message',
+  'continent', 'continentCode',
+  'country', 'countryCode',
+  'region', 'regionName',
+  'city', 'district', 'zip',
+  'lat', 'lon', 'timezone', 'offset',
+  'currency',
+  'isp', 'org', 'as', 'asname',
+  'reverse', 'mobile', 'proxy', 'hosting',
+  'query',
+].join(',');
 const GEO_API_TIMEOUT_MS = 2500;
 
-const GEO_CACHE_TTL_MS = 60 * 60 * 1000;     // 1 hour — IPs rarely move
-const GEO_CACHE_MAX = 5000;                  // LRU cap
+const GEO_CACHE_TTL_MS = 60 * 60 * 1000;
+const GEO_CACHE_MAX = 5000;
 
-const REQUEST_RATE_LIMIT = 100;              // per minute per IP
+const REQUEST_RATE_LIMIT = 100;
 const REQUEST_RATE_WINDOW_MS = 60 * 1000;
 const BODY_LIMIT = '10kb';
 
@@ -68,10 +79,10 @@ function resolveClientIp(req) {
 }
 
 // ---------------------------------------------------------------------------
-// TTL + LRU cache, and in-flight coalescing
+// Cache + in-flight coalescing
 // ---------------------------------------------------------------------------
-const geoCache = new Map();     // ip -> { value, expiresAt }
-const geoInFlight = new Map();  // ip -> Promise<geo>
+const geoCache = new Map();
+const geoInFlight = new Map();
 
 function cacheGet(ip) {
   const entry = geoCache.get(ip);
@@ -80,7 +91,6 @@ function cacheGet(ip) {
     geoCache.delete(ip);
     return null;
   }
-  // refresh LRU position
   geoCache.delete(ip);
   geoCache.set(ip, entry);
   return entry.value;
@@ -123,23 +133,52 @@ function httpGetJson(host, path, timeoutMs) {
   });
 }
 
+function shapeGeo(json) {
+  return {
+    status: json.status || null,
+    message: json.message || null,
+
+    continent: json.continent || null,
+    continentCode: json.continentCode || null,
+
+    country: json.country || null,
+    countryCode: json.countryCode || null,
+
+    region: json.region || null,
+    regionName: json.regionName || null,
+
+    city: json.city || null,
+    district: json.district || null,
+    zip: json.zip || null,
+
+    latitude: typeof json.lat === 'number' ? json.lat : null,
+    longitude: typeof json.lon === 'number' ? json.lon : null,
+    timezone: json.timezone || null,
+    offset: typeof json.offset === 'number' ? json.offset : null,
+    currency: json.currency || null,
+
+    isp: json.isp || null,
+    org: json.org || null,
+    as: json.as || null,
+    asname: json.asname || null,
+    reverse: json.reverse || null,
+
+    mobile: json.mobile === true,
+    proxy: json.proxy === true,
+    hosting: json.hosting === true,
+
+    query: json.query || null,
+  };
+}
+
 async function fetchGeoFromApi(ip) {
   const path = `/json/${encodeURIComponent(ip)}?fields=${encodeURIComponent(GEO_API_FIELDS)}`;
   const json = await httpGetJson(GEO_API_HOST, path, GEO_API_TIMEOUT_MS);
-
   if (json.status !== 'success') {
     const msg = String(json.message || 'fail').toLowerCase().replace(/\s+/g, '_');
     throw new Error(`geo_api_${msg}`);
   }
-
-  return {
-    country: json.country || null,
-    region: json.regionName || null,
-    city: json.city || null,
-    timezone: json.timezone || null,
-    latitude: typeof json.lat === 'number' ? json.lat : null,
-    longitude: typeof json.lon === 'number' ? json.lon : null,
-  };
+  return shapeGeo(json);
 }
 
 function shortReason(err) {
@@ -152,11 +191,6 @@ function shortReason(err) {
   return 'lookup_failed';
 }
 
-/**
- * Returns { geo, reason }:
- *   geo    = { country, region, city, timezone, latitude, longitude } | null
- *   reason = null on success, else a short tag explaining why geo is null
- */
 async function lookupGeo(ip) {
   if (!ip) return { geo: null, reason: 'private_or_missing_ip' };
   if (isPrivateIp(ip)) return { geo: null, reason: 'private_or_missing_ip' };
@@ -230,9 +264,11 @@ async function collectClientData(req) {
       protocol: req.protocol,
       hostname: req.hostname,
       originalUrl: req.originalUrl,
+      query: req.query,
     },
     client: {
       referrer: req.headers.referer || req.headers.referrer || 'Direct',
+      languages,
       preferredLanguage: languages[0] || null,
     },
     requestedAt: new Date().toISOString(),
@@ -240,7 +276,7 @@ async function collectClientData(req) {
 }
 
 // ---------------------------------------------------------------------------
-// HTML rendering
+// HTML rendering — enterprise grid layout
 // ---------------------------------------------------------------------------
 function escapeHtml(v) {
   if (v === null || v === undefined) return '';
@@ -252,64 +288,282 @@ function escapeHtml(v) {
     .replace(/'/g, '&#39;');
 }
 
-const E = (v) => (v === null || v === undefined || v === '' ? '' : escapeHtml(v));
+const E = (v) => (v === null || v === undefined || v === '' ? '—' : escapeHtml(v));
+
+function pill(label, tone = 'neutral') {
+  return `<span class="pill pill-${tone}">${escapeHtml(label)}</span>`;
+}
+
+function field(label, value, opts = {}) {
+  const { mono = false, cls = '' } = opts;
+  return `<div class="field ${cls}">
+    <div class="field-label">${escapeHtml(label)}</div>
+    <div class="field-value${mono ? ' mono' : ''}">${value}</div>
+  </div>`;
+}
+
+function card(title, body, extraClass = '') {
+  return `<section class="card ${extraClass}">
+    <header class="card-header"><h2>${escapeHtml(title)}</h2></header>
+    <div class="card-body">${body}</div>
+  </section>`;
+}
 
 function renderHtml(data) {
   const g = data.ipGeo || {};
   const ua = data.userAgent;
-  const geoNote = data.ipGeoReason ? ` (${E(data.ipGeoReason)})` : '';
   const hasCoords = g.latitude != null && g.longitude != null;
+  const geoNote = data.ipGeoReason
+    ? pill(data.ipGeoReason, 'warn')
+    : g.status === 'success'
+      ? pill('resolved', 'ok')
+      : pill('unknown', 'neutral');
 
+  // --- Risk flags -------------------------------------------------------
+  const riskFlags = [];
+  if (g.proxy === true) riskFlags.push(pill('Proxy / VPN', 'danger'));
+  if (g.hosting === true) riskFlags.push(pill('Hosting / Datacenter', 'danger'));
+  if (g.mobile === true) riskFlags.push(pill('Mobile Network', 'info'));
+  if (riskFlags.length === 0) riskFlags.push(pill('Residential / Clean', 'ok'));
+
+  // --- Map --------------------------------------------------------------
   const mapBlock = hasCoords
-    ? `<div style="margin-top:.75rem;border:1px solid #e5e5e5;border-radius:4px;overflow:hidden">
-  <iframe width="100%" height="300" style="border:0;display:block" loading="lazy" referrerpolicy="no-referrer-when-downgrade"
-    src="https://maps.google.com/maps?q=${g.latitude},${g.longitude}&z=10&output=embed"></iframe>
-</div>`
-    : `<p class="muted" style="margin-top:.75rem">No coordinates available for map</p>`;
+    ? `<div class="map-wrap">
+        <iframe width="100%" height="320" style="border:0;display:block" loading="lazy"
+          referrerpolicy="no-referrer-when-downgrade"
+          src="https://maps.google.com/maps?q=${g.latitude},${g.longitude}&z=10&output=embed"></iframe>
+       </div>`
+    : `<div class="map-empty">No coordinates available — map unavailable</div>`;
+
+  // --- Network card -----------------------------------------------------
+  const networkCard = card(
+    'Network & Organization',
+    `<div class="grid grid-2">
+      ${field('ISP', E(g.isp))}
+      ${field('Organization', E(g.org))}
+      ${field('AS Number', E(g.as), { mono: true })}
+      ${field('AS Name', E(g.asname))}
+      ${field('Reverse DNS', E(g.reverse), { mono: true, cls: 'span-2' })}
+      ${field('Reported Query IP', E(g.query), { mono: true })}
+    </div>
+    <div class="flags">${riskFlags.join('')}</div>`
+  );
+
+  // --- Geolocation card -------------------------------------------------
+  const geoCard = card(
+    'Geolocation',
+    `<div class="grid grid-2">
+      ${field('Continent', `${E(g.continent)} ${g.continentCode ? `<span class="sub">(${escapeHtml(g.continentCode)})</span>` : ''}`)}
+      ${field('Country', `${E(g.country)} ${g.countryCode ? `<span class="sub">(${escapeHtml(g.countryCode)})</span>` : ''}`)}
+      ${field('Region', `${E(g.regionName)} ${g.region ? `<span class="sub">(${escapeHtml(g.region)})</span>` : ''}`)}
+      ${field('City', E(g.city))}
+      ${field('District', E(g.district))}
+      ${field('Postal Code', E(g.zip), { mono: true })}
+      ${field('Latitude', g.latitude != null ? E(g.latitude) : '—', { mono: true })}
+      ${field('Longitude', g.longitude != null ? E(g.longitude) : '—', { mono: true })}
+      ${field('Timezone', E(g.timezone))}
+      ${field('UTC Offset', g.offset != null ? `UTC${g.offset >= 0 ? '+' : ''}${g.offset / 3600}` : '—', { mono: true })}
+      ${field('Currency', E(g.currency), { cls: 'span-2' })}
+    </div>
+    ${mapBlock}`
+  );
+
+  // --- Device card ------------------------------------------------------
+  const deviceCard = card(
+    'Device & Browser',
+    `<div class="grid grid-2">
+      ${field('Browser', `${E(ua.family)} ${E(ua.full)}`)}
+      ${field('Operating System', E(ua.os))}
+      ${field('Device Type', E(ua.device))}
+      ${field('Preferred Language', E(data.client.preferredLanguage))}
+      ${field('All Languages', data.client.languages.length ? data.client.languages.map(escapeHtml).join(', ') : '—', { cls: 'span-2' })}
+      ${field('Referrer', E(data.client.referrer))}
+      ${field('User-Agent', E(ua.raw), { mono: true, cls: 'span-2' })}
+    </div>`
+  );
+
+  // --- Request card -----------------------------------------------------
+  const requestCard = card(
+    'Request',
+    `<div class="grid grid-2">
+      ${field('Client IP', E(data.ipAddress), { mono: true })}
+      ${field('Method', E(data.request.method), { mono: true })}
+      ${field('Protocol', E(data.request.protocol))}
+      ${field('Hostname', E(data.request.hostname))}
+      ${field('URL', E(data.request.originalUrl), { mono: true, cls: 'span-2' })}
+      ${field('Requested At', E(data.requestedAt), { mono: true, cls: 'span-2' })}
+    </div>`
+  );
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Client Info</title>
+<title>Client Info · Diagnostic Report</title>
 <style>
-body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;color:#222;background:#fff;max-width:720px;margin:2rem auto;padding:0 1rem}
-h2{font-size:1rem;margin:1.5rem 0 .5rem;color:#555;border-bottom:1px solid #e5e5e5;padding-bottom:.25rem}
-table{width:100%;border-collapse:collapse}
-td{padding:.35rem .5rem;vertical-align:top;border-bottom:1px solid #f0f0f0}
-td:first-child{color:#666;width:160px;white-space:nowrap}
-code{font-family:ui-monospace,Menlo,monospace;font-size:.9em;background:#f7f7f7;padding:1px 4px;border-radius:3px;word-break:break-all}
-a{color:#06c}.muted{color:#999;font-size:.9em}
+  :root {
+    --bg: #0b0f17;
+    --surface: #121826;
+    --surface-2: #182033;
+    --border: #232c42;
+    --text: #e6ebf5;
+    --muted: #8a94a8;
+    --accent: #5b8def;
+    --ok: #22c55e;
+    --warn: #f59e0b;
+    --danger: #ef4444;
+    --info: #06b6d4;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif;
+    background: radial-gradient(1200px 600px at 20% -10%, #17233c 0%, var(--bg) 55%);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 2rem 1.25rem 4rem;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+
+  /* Header */
+  .page-header {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 1rem; flex-wrap: wrap; margin-bottom: 1.75rem;
+  }
+  .page-header h1 {
+    font-size: 1.35rem; font-weight: 600; margin: 0 0 .25rem;
+    letter-spacing: -0.01em;
+  }
+  .page-header p { margin: 0; color: var(--muted); font-size: .875rem; }
+  .header-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: .4rem;
+    padding: .5rem .85rem; border-radius: 8px; font-size: .8125rem;
+    border: 1px solid var(--border); background: var(--surface-2);
+    color: var(--text); text-decoration: none; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .btn:hover { background: #1f2a44; border-color: #2f3d5c; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #4a7ce0; border-color: #4a7ce0; }
+
+  /* Cards */
+  .card {
+    background: linear-gradient(180deg, var(--surface) 0%, #0f1626 100%);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 1.25rem;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 10px 30px -18px rgba(0,0,0,0.9);
+  }
+  .card-header {
+    padding: .85rem 1.15rem;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.015);
+    display: flex; align-items: center; justify-content: space-between; gap: .75rem;
+  }
+  .card-header h2 {
+    font-size: .8125rem; font-weight: 600; letter-spacing: .06em;
+    text-transform: uppercase; color: #aab4c8; margin: 0;
+  }
+  .card-body { padding: 1.1rem 1.15rem 1.2rem; }
+
+  /* Grid */
+  .grid { display: grid; gap: .9rem 1.25rem; }
+  .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .span-2 { grid-column: span 2; }
+  @media (max-width: 640px) {
+    .grid-2 { grid-template-columns: 1fr; }
+    .span-2 { grid-column: auto; }
+  }
+
+  /* Fields */
+  .field { min-width: 0; }
+  .field-label {
+    font-size: .6875rem; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); margin-bottom: .2rem; font-weight: 500;
+  }
+  .field-value {
+    font-size: .9rem; color: var(--text); word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+  .field-value.mono { font-family: var(--mono); font-size: .84rem; color: #c9d4e8; }
+  .sub { color: var(--muted); font-size: .8125rem; margin-left: .15rem; }
+
+  /* Pills */
+  .flags { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: 1rem; }
+  .pill {
+    display: inline-flex; align-items: center;
+    padding: .22rem .6rem; border-radius: 999px;
+    font-size: .72rem; font-weight: 500; letter-spacing: .02em;
+    border: 1px solid transparent;
+  }
+  .pill-ok      { background: rgba(34,197,94,0.1);  color: #6ee7a0; border-color: rgba(34,197,94,0.25); }
+  .pill-warn    { background: rgba(245,158,11,0.1); color: #fbbf24; border-color: rgba(245,158,11,0.25); }
+  .pill-danger  { background: rgba(239,68,68,0.1);  color: #f87171; border-color: rgba(239,68,68,0.25); }
+  .pill-info    { background: rgba(6,182,212,0.1);  color: #67e8f9; border-color: rgba(6,182,212,0.25); }
+  .pill-neutral { background: rgba(138,148,168,0.1);color: #aab4c8; border-color: rgba(138,148,168,0.25); }
+
+  /* Map */
+  .map-wrap {
+    margin-top: 1.1rem;
+    border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden;
+    background: #0a0f1a;
+  }
+  .map-empty {
+    margin-top: 1.1rem; padding: 1.5rem 1rem; text-align: center;
+    color: var(--muted); font-size: .85rem;
+    border: 1px dashed var(--border); border-radius: 10px;
+  }
+
+  /* Footer */
+  .footer {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: .75rem; flex-wrap: wrap;
+    color: var(--muted); font-size: .78rem; margin-top: 1.75rem;
+  }
+  .footer a { color: var(--accent); text-decoration: none; }
+  .footer a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
-<h2>Request</h2>
-<table>
-<tr><td>IP</td><td><code>${E(data.ipAddress)}</code></td></tr>
-<tr><td>Method</td><td>${E(data.request.method)}</td></tr>
-<tr><td>URL</td><td><code>${E(data.request.originalUrl)}</code></td></tr>
-<tr><td>Referrer</td><td>${E(data.client.referrer)}</td></tr>
-<tr><td>Language</td><td>${E(data.client.preferredLanguage || '')}</td></tr>
-</table>
-<h2>IP Location <span class="muted">(approximate)${geoNote}</span></h2>
-<table>
-<tr><td>Country</td><td>${E(g.country)}</td></tr>
-<tr><td>Region</td><td>${E(g.region)}</td></tr>
-<tr><td>City</td><td>${E(g.city)}</td></tr>
-<tr><td>Timezone</td><td>${E(g.timezone)}</td></tr>
-<tr><td>Latitude</td><td>${g.latitude != null ? E(g.latitude) : ''}</td></tr>
-<tr><td>Longitude</td><td>${g.longitude != null ? E(g.longitude) : ''}</td></tr>
-</table>
-${mapBlock}
-<h2>Device</h2>
-<table>
-<tr><td>Browser</td><td>${E(ua.family)} ${E(ua.full)}</td></tr>
-<tr><td>OS</td><td>${E(ua.os)}</td></tr>
-<tr><td>Device</td><td>${E(ua.device)}</td></tr>
-<tr><td>User-Agent</td><td><code>${E(ua.raw)}</code></td></tr>
-</table>
-<div class="muted" style="margin-top:2rem"><a href="?format=json">JSON</a> · ${E(data.requestedAt)}</div>
+<div class="wrap">
+
+  <header class="page-header">
+    <div>
+      <h1>Client Diagnostic Report</h1>
+      <p>Full request, device, and network intelligence · ${escapeHtml(data.requestedAt)}</p>
+    </div>
+    <div class="header-actions">
+      <a class="btn btn-primary" href="?format=json">View JSON</a>
+      <a class="btn" href="/">Refresh</a>
+    </div>
+  </header>
+
+  ${card(
+    'Summary',
+    `<div class="grid grid-2">
+      ${field('Client IP', E(data.ipAddress), { mono: true })}
+      ${field('IP Resolution', geoNote)}
+      ${field('Location', [g.city, g.regionName, g.country].filter(Boolean).map(escapeHtml).join(', ') || '—', { cls: 'span-2' })}
+      ${field('Network', [g.isp, g.as].filter(Boolean).map(escapeHtml).join(' · ') || '—', { cls: 'span-2' })}
+    </div>`
+  )}
+
+  ${geoCard}
+  ${networkCard}
+  ${deviceCard}
+  ${requestCard}
+
+  <footer class="footer">
+    <span>ip-api.com · cached ${Math.round(GEO_CACHE_TTL_MS / 60000)} min · node ${escapeHtml(process.version)}</span>
+    <span><a href="?format=json">JSON</a> · <a href="/health">Health</a></span>
+  </footer>
+
+</div>
 </body>
 </html>`;
 }
