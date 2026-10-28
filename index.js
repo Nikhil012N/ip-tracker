@@ -137,36 +137,28 @@ function shapeGeo(json) {
   return {
     status: json.status || null,
     message: json.message || null,
-
     continent: json.continent || null,
     continentCode: json.continentCode || null,
-
     country: json.country || null,
     countryCode: json.countryCode || null,
-
     region: json.region || null,
     regionName: json.regionName || null,
-
     city: json.city || null,
     district: json.district || null,
     zip: json.zip || null,
-
     latitude: typeof json.lat === 'number' ? json.lat : null,
     longitude: typeof json.lon === 'number' ? json.lon : null,
     timezone: json.timezone || null,
     offset: typeof json.offset === 'number' ? json.offset : null,
     currency: json.currency || null,
-
     isp: json.isp || null,
     org: json.org || null,
     as: json.as || null,
     asname: json.asname || null,
     reverse: json.reverse || null,
-
     mobile: json.mobile === true,
     proxy: json.proxy === true,
     hosting: json.hosting === true,
-
     query: json.query || null,
   };
 }
@@ -318,7 +310,6 @@ function renderHtml(data) {
       ? 'resolved'
       : 'unknown';
 
-  // --- Map --------------------------------------------------------------
   const mapBlock = hasCoords
     ? `<div class="map-wrap">
         <iframe
@@ -332,7 +323,6 @@ function renderHtml(data) {
        </div>`
     : `<div class="map-empty">No coordinates available for map</div>`;
 
-  // --- Summary ----------------------------------------------------------
   const summaryCard = card(
     'Summary',
     `<dl class="grid grid-2">
@@ -343,7 +333,6 @@ function renderHtml(data) {
     </dl>`
   );
 
-  // --- Geolocation ------------------------------------------------------
   const geoCard = card(
     'Geolocation',
     `<dl class="grid grid-2">
@@ -362,7 +351,6 @@ function renderHtml(data) {
     ${mapBlock}`
   );
 
-  // --- Network ----------------------------------------------------------
   const flags = [];
   if (g.proxy === true) flags.push('<span class="badge badge-outline">Proxy</span>');
   if (g.hosting === true) flags.push('<span class="badge badge-outline">Hosting</span>');
@@ -382,7 +370,6 @@ function renderHtml(data) {
     <div class="flags">${flags.join('')}</div>`
   );
 
-  // --- Device -----------------------------------------------------------
   const deviceCard = card(
     'Device',
     `<dl class="grid grid-2">
@@ -396,7 +383,6 @@ function renderHtml(data) {
     </dl>`
   );
 
-  // --- Request ----------------------------------------------------------
   const requestCard = card(
     'Request',
     `<dl class="grid grid-2">
@@ -417,9 +403,6 @@ function renderHtml(data) {
 <meta name="color-scheme" content="dark">
 <title>Client Info</title>
 <style>
-  /* ------------------------------------------------------------------
-     shadcn/ui tokens — dark mode
-     ------------------------------------------------------------------ */
   :root {
     --background: oklch(0.145 0 0);
     --foreground: oklch(0.985 0 0);
@@ -456,7 +439,6 @@ function renderHtml(data) {
     -moz-osx-font-smoothing: grayscale;
   }
 
-  /* Container — responsive horizontal padding, centered, capped width */
   .wrap {
     width: 100%;
     max-width: 960px;
@@ -470,7 +452,6 @@ function renderHtml(data) {
     .wrap { padding: 2.5rem 2rem 5rem; }
   }
 
-  /* Header — stacks on mobile, side-by-side from sm up */
   .page-header {
     display: flex;
     flex-direction: column;
@@ -506,7 +487,6 @@ function renderHtml(data) {
     .header-actions { width: auto; }
   }
 
-  /* Buttons — full-width on mobile, auto from sm up */
   .btn {
     flex: 1;
     display: inline-flex;
@@ -539,7 +519,6 @@ function renderHtml(data) {
     .btn { flex: 0 0 auto; }
   }
 
-  /* Card */
   .card {
     background: var(--card);
     color: var(--card-foreground);
@@ -568,7 +547,6 @@ function renderHtml(data) {
     .card-content { padding: 0.75rem 1.25rem 1.25rem; }
   }
 
-  /* Grid — single column on mobile, two columns from sm up */
   .grid {
     display: grid;
     grid-template-columns: 1fr;
@@ -580,7 +558,6 @@ function renderHtml(data) {
     .span-2 { grid-column: span 2; }
   }
 
-  /* Field */
   .field { min-width: 0; margin: 0; }
   .field-label {
     font-size: 0.75rem;
@@ -603,7 +580,6 @@ function renderHtml(data) {
     color: var(--foreground);
   }
 
-  /* Badge */
   .badge {
     display: inline-flex;
     align-items: center;
@@ -635,7 +611,6 @@ function renderHtml(data) {
     border-top: 1px solid var(--border);
   }
 
-  /* Map — fixed aspect ratio, responsive height */
   .map-wrap {
     position: relative;
     width: 100%;
@@ -665,7 +640,6 @@ function renderHtml(data) {
     .map-empty { padding: 2rem 1rem; }
   }
 
-  /* Footer — stacks on mobile */
   .footer {
     display: flex;
     flex-direction: column;
@@ -690,7 +664,6 @@ function renderHtml(data) {
   }
   .footer a:hover { color: var(--foreground); }
 
-  /* Respect reduced motion */
   @media (prefers-reduced-motion: reduce) {
     .btn { transition: none; }
   }
@@ -840,7 +813,7 @@ function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('unhandledRejection', (reason) => logger.error('Unhandled rejection:', reason));
-process.on('uncaughtException', (err) {
+process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception:', err);
   shutdown('uncaughtException');
 });
