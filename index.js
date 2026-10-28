@@ -2,16 +2,32 @@
 
 const express = require('express');
 const useragent = require('useragent');
-const geoip = require('geoip-lite');
 const requestIp = require('request-ip');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-require('dotenv').config();
+const http = require('http');
 
-const PORT = parseInt(process.env.PORT, 10) || 3000;
-const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_KEY || '';
+// ---------------------------------------------------------------------------
+// Constants — single source of truth for tuning
+// ---------------------------------------------------------------------------
+const PORT = 3000;
+const NODE_ENV = process.env.NODE_ENV || 'production';
 
+const GEO_API_HOST = 'ip-api.com';           // free tier: HTTP only, 45 req/min
+const GEO_API_FIELDS = 'status,message,country,regionName,city,timezone,lat,lon,query';
+const GEO_API_TIMEOUT_MS = 2500;
+
+const GEO_CACHE_TTL_MS = 60 * 60 * 1000;     // 1 hour — IPs rarely move
+const GEO_CACHE_MAX = 5000;                  // LRU cap
+
+const REQUEST_RATE_LIMIT = 100;              // per minute per IP
+const REQUEST_RATE_WINDOW_MS = 60 * 1000;
+const BODY_LIMIT = '10kb';
+
+// ---------------------------------------------------------------------------
+// Logger
+// ---------------------------------------------------------------------------
 const logger = {
   info: (...a) => console.log(`[INFO]  ${new Date().toISOString()}`, ...a),
   warn: (...a) => console.warn(`[WARN]  ${new Date().toISOString()}`, ...a),
@@ -26,6 +42,9 @@ class AppError extends Error {
   }
 }
 
+// ---------------------------------------------------------------------------
+// IP helpers
+// ---------------------------------------------------------------------------
 function normalizeIp(ip) {
   if (!ip || typeof ip !== 'string') return '';
   return ip.replace(/^::ffff:/, '').trim();
@@ -39,8 +58,8 @@ function isPrivateIp(ip) {
   if (/^192\.168\./.test(ip)) return true;
   if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) return true;
   if (/^169\.254\./.test(ip)) return true;
-  if (/^fc|^fd/.test(ip)) return true;
-  if (/^fe80:/.test(ip)) return true;
+  if (/^f[cd]/i.test(ip)) return true;
+  if (/^fe80:/i.test(ip)) return true;
   return false;
 }
 
@@ -48,13 +67,140 @@ function resolveClientIp(req) {
   return normalizeIp(requestIp.getClientIp(req) || '');
 }
 
+// ---------------------------------------------------------------------------
+// TTL + LRU cache, and in-flight coalescing
+// ---------------------------------------------------------------------------
+const geoCache = new Map();     // ip -> { value, expiresAt }
+const geoInFlight = new Map();  // ip -> Promise<geo>
+
+function cacheGet(ip) {
+  const entry = geoCache.get(ip);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    geoCache.delete(ip);
+    return null;
+  }
+  // refresh LRU position
+  geoCache.delete(ip);
+  geoCache.set(ip, entry);
+  return entry.value;
+}
+
+function cacheSet(ip, value) {
+  if (geoCache.size >= GEO_CACHE_MAX) {
+    const oldest = geoCache.keys().next().value;
+    if (oldest !== undefined) geoCache.delete(oldest);
+  }
+  geoCache.set(ip, { value, expiresAt: Date.now() + GEO_CACHE_TTL_MS });
+}
+
+// ---------------------------------------------------------------------------
+// ip-api.com client
+// ---------------------------------------------------------------------------
+function httpGetJson(host, path, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(
+      { host, path, timeout: timeoutMs, headers: { 'User-Agent': 'client-info-app/1.0' } },
+      (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          body += chunk;
+          if (body.length > 64 * 1024) req.destroy(new Error('response_too_large'));
+        });
+        res.on('end', () => {
+          if (res.statusCode !== 200) return reject(new Error(`geo_api_http_${res.statusCode}`));
+          try {
+            resolve(JSON.parse(body));
+          } catch {
+            reject(new Error('geo_api_bad_json'));
+          }
+        });
+      }
+    );
+    req.on('timeout', () => req.destroy(new Error('geo_api_timeout')));
+    req.on('error', reject);
+  });
+}
+
+async function fetchGeoFromApi(ip) {
+  const path = `/json/${encodeURIComponent(ip)}?fields=${encodeURIComponent(GEO_API_FIELDS)}`;
+  const json = await httpGetJson(GEO_API_HOST, path, GEO_API_TIMEOUT_MS);
+
+  if (json.status !== 'success') {
+    const msg = String(json.message || 'fail').toLowerCase().replace(/\s+/g, '_');
+    throw new Error(`geo_api_${msg}`);
+  }
+
+  return {
+    country: json.country || null,
+    region: json.regionName || null,
+    city: json.city || null,
+    timezone: json.timezone || null,
+    latitude: typeof json.lat === 'number' ? json.lat : null,
+    longitude: typeof json.lon === 'number' ? json.lon : null,
+  };
+}
+
+function shortReason(err) {
+  const m = String((err && err.message) || 'lookup_failed');
+  if (m.includes('timeout')) return 'lookup_timeout';
+  if (m.includes('private') || m.includes('reserved') || m.includes('invalid')) {
+    return 'private_or_missing_ip';
+  }
+  if (m.includes('rate') || m.includes('limit')) return 'rate_limited';
+  return 'lookup_failed';
+}
+
+/**
+ * Returns { geo, reason }:
+ *   geo    = { country, region, city, timezone, latitude, longitude } | null
+ *   reason = null on success, else a short tag explaining why geo is null
+ */
+async function lookupGeo(ip) {
+  if (!ip) return { geo: null, reason: 'private_or_missing_ip' };
+  if (isPrivateIp(ip)) return { geo: null, reason: 'private_or_missing_ip' };
+
+  const cached = cacheGet(ip);
+  if (cached) return { geo: cached, reason: null };
+
+  if (geoInFlight.has(ip)) {
+    try {
+      return { geo: await geoInFlight.get(ip), reason: null };
+    } catch (err) {
+      return { geo: null, reason: shortReason(err) };
+    }
+  }
+
+  const promise = (async () => {
+    try {
+      const geo = await fetchGeoFromApi(ip);
+      cacheSet(ip, geo);
+      return geo;
+    } catch (err) {
+      logger.warn(`Geo lookup failed for ${ip}:`, err.message);
+      throw err;
+    } finally {
+      geoInFlight.delete(ip);
+    }
+  })();
+
+  geoInFlight.set(ip, promise);
+
+  try {
+    return { geo: await promise, reason: null };
+  } catch (err) {
+    return { geo: null, reason: shortReason(err) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Client data
+// ---------------------------------------------------------------------------
 function parseAgent(uaString) {
   const agent = useragent.parse(uaString || '');
   return {
     family: agent.family || 'Unknown',
-    major: agent.major || '',
-    minor: agent.minor || '',
-    patch: agent.patch || '',
     full: agent.toVersion ? agent.toVersion() : '',
     os: agent.os ? agent.os.toString() : 'Unknown',
     device: agent.device ? agent.device.toString() : 'Unknown',
@@ -62,35 +208,17 @@ function parseAgent(uaString) {
   };
 }
 
-function lookupGeo(ip) {
-  if (!ip || isPrivateIp(ip)) return { geo: null, reason: 'private_or_missing_ip' };
-  try {
-    const g = geoip.lookup(ip);
-    if (!g) return { geo: null, reason: 'not_in_database' };
-    return {
-      geo: {
-        country: g.country || null,
-        region: g.region || null,
-        city: g.city || null,
-        timezone: g.timezone || null,
-        latitude: Array.isArray(g.ll) ? g.ll[0] : null,
-        longitude: Array.isArray(g.ll) ? g.ll[1] : null,
-      },
-      reason: null,
-    };
-  } catch (err) {
-    logger.warn('GeoIP lookup failed:', err.message);
-    return { geo: null, reason: 'lookup_failed' };
-  }
-}
-
-function collectClientData(req) {
+async function collectClientData(req) {
   const clientIp = resolveClientIp(req);
   const userAgent = parseAgent(req.headers['user-agent']);
-  const { geo, reason } = lookupGeo(clientIp);
+  const { geo, reason } = await lookupGeo(clientIp);
 
   const rawLang = req.headers['accept-language'] || '';
-  const languages = rawLang.split(',').map(s => s.trim().split(';')[0]).filter(Boolean).slice(0, 5);
+  const languages = rawLang
+    .split(',')
+    .map((s) => s.trim().split(';')[0])
+    .filter(Boolean)
+    .slice(0, 5);
 
   return {
     ipAddress: clientIp || 'Unknown',
@@ -102,17 +230,18 @@ function collectClientData(req) {
       protocol: req.protocol,
       hostname: req.hostname,
       originalUrl: req.originalUrl,
-      query: req.query,
     },
     client: {
       referrer: req.headers.referer || req.headers.referrer || 'Direct',
-      languages,
       preferredLanguage: languages[0] || null,
     },
     requestedAt: new Date().toISOString(),
   };
 }
 
+// ---------------------------------------------------------------------------
+// HTML rendering
+// ---------------------------------------------------------------------------
 function escapeHtml(v) {
   if (v === null || v === undefined) return '';
   return String(v)
@@ -131,16 +260,12 @@ function renderHtml(data) {
   const geoNote = data.ipGeoReason ? ` (${E(data.ipGeoReason)})` : '';
   const hasCoords = g.latitude != null && g.longitude != null;
 
-  let mapBlock = '';
-  if (hasCoords) {
-    const embedUrl = `https://maps.google.com/maps?q=${g.latitude},${g.longitude}&z=10&output=embed`;
-    mapBlock = `
-<div style="margin-top:.75rem;border:1px solid #e5e5e5;border-radius:4px;overflow:hidden">
-  <iframe width="100%" height="300" style="border:0;display:block" loading="lazy" referrerpolicy="no-referrer-when-downgrade" src="${embedUrl}"></iframe>
-</div>`;
-  } else {
-    mapBlock = `<p class="muted" style="margin-top:.75rem">No coordinates available for map</p>`;
-  }
+  const mapBlock = hasCoords
+    ? `<div style="margin-top:.75rem;border:1px solid #e5e5e5;border-radius:4px;overflow:hidden">
+  <iframe width="100%" height="300" style="border:0;display:block" loading="lazy" referrerpolicy="no-referrer-when-downgrade"
+    src="https://maps.google.com/maps?q=${g.latitude},${g.longitude}&z=10&output=embed"></iframe>
+</div>`
+    : `<p class="muted" style="margin-top:.75rem">No coordinates available for map</p>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -189,55 +314,54 @@ ${mapBlock}
 </html>`;
 }
 
+// ---------------------------------------------------------------------------
+// Express app
+// ---------------------------------------------------------------------------
 const app = express();
-
-// Always trust proxy - but trust exactly 1 hop (safest interpretation)
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
 
-// Security headers
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
-      frameSrc: ["https://*.google.com", "https://*.googleapis.com", "https://*.gstatic.com"],
-      imgSrc: ["'self'", "data:", "https:"],
-      objectSrc: ["'none'"],
-      frameAncestors: ["'none'"],
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        frameSrc: ['https://*.google.com', 'https://*.googleapis.com', 'https://*.gstatic.com'],
+        imgSrc: ["'self'", 'data:', 'https:'],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
     },
-  },
-}));
+  })
+);
 
-// Rate limiting: 100 requests per minute per IP
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 100,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: { success: false, error: { code: 'RATE_LIMIT', message: 'Too many requests' } },
-});
-app.use(limiter);
+app.use(
+  rateLimit({
+    windowMs: REQUEST_RATE_WINDOW_MS,
+    max: REQUEST_RATE_LIMIT,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { success: false, error: { code: 'RATE_LIMIT', message: 'Too many requests' } },
+  })
+);
 
-// Body size limit
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: BODY_LIMIT }));
+app.use(cors({ origin: NODE_ENV === 'production' ? false : true }));
 
-// CORS - restrict to same origin in production
-app.use(cors({
-  origin: process.env.NODE_ENV === 'production' ? false : true,
-}));
-
-// Access log
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
-    logger.info(`${req.method} ${req.originalUrl} → ${res.statusCode} (${Date.now() - start}ms) ip=${resolveClientIp(req) || 'unknown'}`);
+    logger.info(
+      `${req.method} ${req.originalUrl} → ${res.statusCode} (${Date.now() - start}ms) ip=${resolveClientIp(req) || 'unknown'}`
+    );
   });
   next();
 });
 
-app.get('/', (req, res, next) => {
+app.get('/', async (req, res, next) => {
   try {
-    const data = collectClientData(req);
+    const data = await collectClientData(req);
     const wantsJson = req.query.format === 'json' || req.accepts(['html', 'json']) === 'json';
     if (wantsJson) return res.json({ success: true, data });
     res.type('html').send(renderHtml(data));
@@ -250,15 +374,15 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// 404 handler
 app.use((req, res) => {
   if (req.accepts('json') && !req.accepts('html')) {
-    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Route not found' } });
+    return res
+      .status(404)
+      .json({ success: false, error: { code: 'NOT_FOUND', message: 'Route not found' } });
   }
   res.status(404).type('html').send('<h1>404</h1>');
 });
 
-// Global error handler - never leaks stack traces
 app.use((err, req, res, _next) => {
   const known = err instanceof AppError;
   const statusCode = known ? err.statusCode : 500;
@@ -272,21 +396,30 @@ app.use((err, req, res, _next) => {
       error: { code, message: known ? err.message : 'Internal server error' },
     });
   }
-  res.status(statusCode).type('html').send(
-    `<!DOCTYPE html><meta charset="UTF-8"><title>Error</title>` +
-    `<h1>Error ${statusCode}</h1><p>${escapeHtml(code)}</p>` +
-    `${known ? `<p>${escapeHtml(err.message)}</p>` : ''}<p><a href="/">Back</a></p>`
-  );
+  res
+    .status(statusCode)
+    .type('html')
+    .send(
+      `<!DOCTYPE html><meta charset="UTF-8"><title>Error</title>` +
+        `<h1>Error ${statusCode}</h1><p>${escapeHtml(code)}</p>` +
+        `${known ? `<p>${escapeHtml(err.message)}</p>` : ''}<p><a href="/">Back</a></p>`
+    );
 });
 
-const server = app.listen(PORT, () => {
-  logger.info(`Server running at http://localhost:${PORT}`);
+// ---------------------------------------------------------------------------
+// Start / shutdown
+// ---------------------------------------------------------------------------
+const server = app.listen(PORT, '0.0.0.0', () => {
+  logger.info(`Server listening on :${PORT} (env=${NODE_ENV})`);
 });
 
 function shutdown(signal) {
   logger.info(`${signal} received — shutting down`);
   server.close((err) => {
-    if (err) { logger.error('Shutdown error:', err); process.exit(1); }
+    if (err) {
+      logger.error('Shutdown error:', err);
+      process.exit(1);
+    }
     process.exit(0);
   });
   setTimeout(() => process.exit(1), 10000).unref();
